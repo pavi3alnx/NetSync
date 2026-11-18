@@ -17,6 +17,7 @@ final class ConnectionState implements ConnectionContext {
     ByteBuffer payload;
     int queuedBytes;
     boolean closing;
+    boolean closed;
     long lastProgress = System.nanoTime();
 
     ConnectionState(SelectionKey key) { this.key = key; }

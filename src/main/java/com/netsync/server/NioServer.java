@@ -14,6 +14,7 @@ import java.util.function.BiConsumer;
 
 /** Single-use, loopback TCP transport. Callbacks run on the selector thread and must not block. */
 public final class NioServer implements AutoCloseable, OutboundSink {
+    private static final System.Logger LOG = System.getLogger(NioServer.class.getName());
     private static final int FRAME_BUDGET = 32;
     private static final int BYTE_BUDGET = 256 * 1024;
     private final int port;
@@ -72,7 +73,10 @@ public final class NioServer implements AutoCloseable, OutboundSink {
                 while (running && keys.hasNext()) {
                     SelectionKey key = keys.next();
                     keys.remove();
-                    if (!key.isValid()) continue;
+                    if (!key.isValid()) {
+                        if (key.attachment() instanceof ConnectionState state) disconnect(state);
+                        continue;
+                    }
                     if (key.isAcceptable()) {
                         accept();
                         continue;
@@ -81,7 +85,11 @@ public final class NioServer implements AutoCloseable, OutboundSink {
                     try {
                         if (key.isReadable()) read(state);
                         if (key.isValid() && key.isWritable()) write(state);
-                    } catch (IOException | RuntimeException e) {
+                    } catch (IOException | CancelledKeyException e) {
+                        logFailure(System.Logger.Level.DEBUG, "Client transport closed", e);
+                        disconnect(state);
+                    } catch (RuntimeException e) {
+                        logFailure(System.Logger.Level.WARNING, "Client processing failed", e);
                         disconnect(state);
                     }
                 }
@@ -95,6 +103,11 @@ public final class NioServer implements AutoCloseable, OutboundSink {
             }
         } catch (IOException e) {
             failure = e;
+            logFailure(System.Logger.Level.ERROR, "TCP selector failed", e);
+        } catch (RuntimeException e) {
+            // Expose an unexpected loop failure through the existing failure accessor too.
+            failure = new IOException("Unexpected selector failure: " + e.getClass().getName());
+            logFailure(System.Logger.Level.ERROR, "TCP selector failed", e);
         } finally {
             running = false;
             cleanup();
@@ -116,7 +129,8 @@ public final class NioServer implements AutoCloseable, OutboundSink {
                 key.attach(state);
                 connections.put(state.connectionId(), state);
             } catch (IOException | RuntimeException e) {
-                channel.close();
+                logFailure(System.Logger.Level.WARNING, "Client registration failed", e);
+                closeQuietly(channel);
             }
         }
     }
@@ -151,7 +165,8 @@ public final class NioServer implements AutoCloseable, OutboundSink {
                     OutboundFrame frame = codec.decodePayload(target);
                     if (frame instanceof MessageEnvelope message) messages.handle(state, message);
                     else chunks.accept(state, (FileChunk) frame);
-                    if (!state.key.isValid() || state.closing) return;
+                    if (!state.key.isValid()) { disconnect(state); return; }
+                    if (state.closing) return;
                 }
             } catch (ProtocolException e) {
                 protocolFailure(state, e);
@@ -173,9 +188,14 @@ public final class NioServer implements AutoCloseable, OutboundSink {
 
     /** Selector-thread only, as required by the shared OutboundSink contract. */
     @Override public EnqueueResult send(UUID connectionId, OutboundFrame frame) {
-        if (Thread.currentThread() != thread) throw new IllegalStateException("Selector thread required");
+        requireSelectorThread();
         ConnectionState state = connections.get(connectionId);
-        if (state == null || state.closing || !state.key.isValid()) return EnqueueResult.REJECTED;
+        if (state == null) return EnqueueResult.REJECTED;
+        if (!state.key.isValid() || !state.key.channel().isOpen()) {
+            disconnect(state);
+            return EnqueueResult.REJECTED;
+        }
+        if (state.closing) return EnqueueResult.REJECTED;
         ByteBuffer encoded;
         try { encoded = codec.encode(frame); }
         catch (ProtocolException e) { return EnqueueResult.REJECTED; }
@@ -212,12 +232,33 @@ public final class NioServer implements AutoCloseable, OutboundSink {
         }
     }
 
+    /**
+     * Immediately close a client from a handler, discarding pending output.
+     * Selector-thread only, like send; false means the connection was already absent.
+     */
+    public boolean closeConnection(UUID connectionId) {
+        requireSelectorThread();
+        ConnectionState state = connections.get(connectionId);
+        if (state == null) return false;
+        disconnect(state);
+        return true;
+    }
+
+    private void requireSelectorThread() {
+        if (Thread.currentThread() != thread) throw new IllegalStateException("Selector thread required");
+    }
+
     private void disconnect(ConnectionState state) {
+        if (state.closed) return;
+        state.closed = true;
         connections.remove(state.connectionId());
         state.key.cancel();
+        state.key.attach(null);
         closeQuietly(state.key.channel());
         state.output.clear();
+        state.queuedBytes = 0;
         state.payload = null;
+        state.prefix.clear();
     }
 
     private void cleanup() {
@@ -227,7 +268,13 @@ public final class NioServer implements AutoCloseable, OutboundSink {
     }
 
     private static void closeQuietly(AutoCloseable resource) {
-        if (resource != null) try { resource.close(); } catch (Exception ignored) { }
+        if (resource != null) try { resource.close(); }
+        catch (Exception e) { logFailure(System.Logger.Level.WARNING, "Transport resource close failed", e); }
+    }
+
+    private static void logFailure(System.Logger.Level level, String operation, Exception error) {
+        // Exception messages/causes from handlers may contain credentials or raw input.
+        LOG.log(level, operation + " (" + error.getClass().getName() + ")");
     }
 
     /** Stops accepting and closes all clients; no application work needs draining in this milestone. */
