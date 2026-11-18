@@ -430,4 +430,191 @@ class NioServerTest {
             assertTrue(server.isRunning());
         }
     }
+
+    @Test void completeFramesThenPartialFrameRetainOrderAndAllowOtherClients() throws Exception {
+        var queue = new LinkedBlockingQueue<Received>();
+        try (NioServer server = server(queue); Socket busy = connect(server); Socket other = connect(server)) {
+            for (int split : new int[]{2, 5, 20}) {
+                MessageEnvelope first = message(), second = message(), partial = message(), independent = message();
+                byte[] tail = encode(partial);
+                var combined = new java.io.ByteArrayOutputStream();
+                combined.write(encode(first));
+                combined.write(encode(second));
+                combined.write(tail, 0, split);
+                busy.getOutputStream().write(combined.toByteArray());
+                assertEquals(first, next(queue).frame());
+                assertEquals(second, next(queue).frame());
+                other.getOutputStream().write(encode(independent));
+                assertEquals(independent, next(queue).frame());
+                // Many tiny writes must neither lose bytes nor dispatch the unfinished frame.
+                for (int offset = split; offset < tail.length; offset++) busy.getOutputStream().write(tail[offset]);
+                assertEquals(partial, next(queue).frame());
+            }
+            assertNull(server.failure());
+        }
+    }
+
+    @Test void maximumJsonAndBinaryFramesRoundTripInQueuedOrder() throws Exception {
+        MessageEnvelope empty = new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), null,
+                new MessageBody.Error(ErrorCode.BUSY, "", null));
+        int padding = ProtocolLimits.MAX_JSON_BYTES - (encode(empty).length - 5);
+        MessageEnvelope maximum = new MessageEnvelope(1, MessageType.ERROR, empty.messageId(), null,
+                new MessageBody.Error(ErrorCode.BUSY, "x".repeat(padding), null));
+        byte[] data = new byte[ProtocolLimits.MAX_CHUNK_BYTES];
+        for (int i = 0; i < data.length; i++) data[i] = (byte) i; // Includes NUL and invalid UTF-8.
+        byte[] jsonLooking = "{\"binary\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        System.arraycopy(jsonLooking, 0, data, 0, jsonLooking.length);
+        FileChunk binary = new FileChunk(UUID.randomUUID(), UUID.randomUUID(), 0, data);
+        FileChunk last = new FileChunk(UUID.randomUUID(), binary.transferId(), 1, new byte[]{(byte) 255});
+        assertEquals(65_537, ByteBuffer.wrap(encode(maximum)).getInt());
+        assertEquals(16_421, ByteBuffer.wrap(encode(binary)).getInt());
+        var frames = java.util.List.<OutboundFrame>of(message(), maximum, binary, message(), last);
+        var owner = new AtomicReference<NioServer>();
+        var results = new LinkedBlockingQueue<EnqueueResult>();
+        try (NioServer server = new NioServer(0,
+                (context, frame) -> results.add(owner.get().send(context.connectionId(), frame)),
+                (context, frame) -> results.add(owner.get().send(context.connectionId(), frame)))) {
+            owner.set(server);
+            server.start();
+            try (Socket client = connect(server)) {
+                var combined = new java.io.ByteArrayOutputStream();
+                for (OutboundFrame frame : frames) combined.write(encode(frame));
+                client.getOutputStream().write(combined.toByteArray());
+                for (OutboundFrame expected : frames) {
+                    assertEquals(EnqueueResult.ACCEPTED, results.poll(3, TimeUnit.SECONDS));
+                    assertEquals(expected, readFrame(client));
+                }
+                assertNull(server.failure());
+            }
+        }
+    }
+
+    @Test void oversizedBinaryFramesCloseAsSoonAsKindArrives() throws Exception {
+        var queue = new LinkedBlockingQueue<Received>();
+        try (NioServer server = server(queue); Socket healthy = connect(server)) {
+            int maximumBinaryLength = 1 + ProtocolLimits.CHUNK_HEADER_BYTES + ProtocolLimits.MAX_CHUNK_BYTES;
+            for (int length : new int[]{maximumBinaryLength + 1, ProtocolLimits.MAX_FRAME_LENGTH}) {
+                try (Socket bad = connect(server)) {
+                    // These prefixes pass the global limit. No binary header/data is sent.
+                    bad.getOutputStream().write(ByteBuffer.allocate(5).putInt(length)
+                            .put(ProtocolLimits.CHUNK_KIND).array());
+                    assertEquals(-1, bad.getInputStream().read());
+                }
+            }
+            MessageEnvelope request = message();
+            healthy.getOutputStream().write(encode(request));
+            assertEquals(request, next(queue).frame());
+            assertNull(server.failure());
+        }
+    }
+
+    @Test void negativeBinarySequenceIsRejectedWithoutDispatch() throws Exception {
+        var queue = new LinkedBlockingQueue<Received>();
+        try (NioServer server = server(queue); Socket bad = connect(server); Socket healthy = connect(server)) {
+            byte[] wire = encode(new FileChunk(UUID.randomUUID(), UUID.randomUUID(), 0, new byte[]{42}));
+            ByteBuffer.wrap(wire).putInt(4 + 1 + 16 + 16, -1);
+            bad.getOutputStream().write(wire);
+            assertEquals(-1, bad.getInputStream().read());
+            MessageEnvelope request = message();
+            healthy.getOutputStream().write(encode(request));
+            assertEquals(request, next(queue).frame());
+            assertTrue(queue.isEmpty());
+            assertNull(server.failure());
+        }
+    }
+
+    @Test void eofDuringPrefixKindOrBodyDiscardsPartialState() throws Exception {
+        var states = new LinkedBlockingQueue<ConnectionState>();
+        try (NioServer server = new NioServer(0, (context, frame) -> states.add((ConnectionState) context),
+                (context, chunk) -> states.add((ConnectionState) context))) {
+            server.start();
+            try (Socket healthy = connect(server)) {
+                for (int split : new int[]{1, 3, 4, 5, 20}) {
+                    try (Socket truncated = connect(server)) {
+                        truncated.getOutputStream().write(encode(message()));
+                        ConnectionState state = states.poll(3, TimeUnit.SECONDS);
+                        assertNotNull(state);
+                        byte[] incomplete = encode(message());
+                        truncated.getOutputStream().write(incomplete, 0, split);
+                        truncated.shutdownOutput();
+                        assertEquals(-1, truncated.getInputStream().read());
+                        // A subsequent healthy callback synchronizes with the completed cleanup.
+                        healthy.getOutputStream().write(encode(message()));
+                        ConnectionState other = states.poll(3, TimeUnit.SECONDS);
+                        assertNotNull(other);
+                        assertNotSame(state, other, "Truncated frame must not reach a handler");
+                        assertReleased(state);
+                        assertTrue(states.isEmpty());
+                    }
+                }
+                assertNull(server.failure());
+            }
+        }
+    }
+
+    @Test void recoverableBodyErrorDoesNotCorruptCoalescedFollowingFrame() throws Exception {
+        var queue = new LinkedBlockingQueue<Received>();
+        try (NioServer server = server(queue); Socket client = connect(server)) {
+            MessageEnvelope invalid = message(), valid = message();
+            byte[] encoded = encode(invalid);
+            String json = new String(encoded, 5, encoded.length - 5, java.nio.charset.StandardCharsets.UTF_8)
+                    .replace("\"body\":{}", "\"body\":{\"unexpected\":true}");
+            byte[] body = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            var combined = new java.io.ByteArrayOutputStream();
+            combined.write(ByteBuffer.allocate(5 + body.length).putInt(1 + body.length)
+                    .put(ProtocolLimits.JSON_KIND).put(body).array());
+            combined.write(encode(valid));
+            client.getOutputStream().write(combined.toByteArray());
+            assertEquals(valid, next(queue).frame());
+            MessageEnvelope error = assertInstanceOf(MessageEnvelope.class, readFrame(client));
+            assertEquals(invalid.messageId(), error.replyTo());
+            assertEquals(ErrorCode.INVALID_REQUEST, ((MessageBody.Error) error.body()).code());
+            assertTrue(queue.isEmpty());
+            assertNull(server.failure());
+        }
+    }
+
+    @Test void outputByteLimitRejectsBeforeFrameCountLimitAndClearsQueue() throws Exception {
+        FileChunk chunk = new FileChunk(UUID.randomUUID(), UUID.randomUUID(), 0,
+                new byte[ProtocolLimits.MAX_CHUNK_BYTES]);
+        int encodedSize = encode(chunk).length;
+        int acceptedCount = ProtocolLimits.MAX_OUTPUT_BYTES / encodedSize;
+        assertTrue(acceptedCount + 1 < ProtocolLimits.MAX_OUTPUT_FRAMES);
+        var owner = new AtomicReference<NioServer>();
+        var checks = new LinkedBlockingQueue<Boolean>();
+        var states = new LinkedBlockingQueue<ConnectionState>();
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            if (request.type() != MessageType.LOGOUT_REQUEST) {
+                checks.add(owner.get().send(context.connectionId(), request) == EnqueueResult.ACCEPTED);
+                return;
+            }
+            ConnectionState state = (ConnectionState) context;
+            boolean accepted = true;
+            for (int i = 0; i < acceptedCount; i++) {
+                accepted &= owner.get().send(context.connectionId(), chunk) == EnqueueResult.ACCEPTED;
+            }
+            boolean accounted = state.queuedBytes == acceptedCount * encodedSize
+                    && state.output.size() == acceptedCount;
+            boolean rejected = owner.get().send(context.connectionId(), chunk) == EnqueueResult.REJECTED;
+            checks.add(accepted && accounted && rejected);
+            states.add(state);
+        }, (context, frame) -> {})) {
+            owner.set(server);
+            server.start();
+            try (Socket slow = connect(server); Socket healthy = connect(server)) {
+                slow.getOutputStream().write(encode(new MessageEnvelope(1, MessageType.LOGOUT_REQUEST,
+                        UUID.randomUUID(), null, new MessageBody.Empty())));
+                assertEquals(Boolean.TRUE, checks.poll(3, TimeUnit.SECONDS));
+                ConnectionState state = states.poll(3, TimeUnit.SECONDS);
+                assertNotNull(state);
+                assertReleased(state);
+                assertEquals(-1, slow.getInputStream().read());
+                MessageEnvelope request = message();
+                healthy.getOutputStream().write(encode(request));
+                assertEquals(Boolean.TRUE, checks.poll(3, TimeUnit.SECONDS));
+                assertEquals(request, readFrame(healthy));
+                assertNull(server.failure());
+            }
+        }
+    }
 }
