@@ -11,6 +11,7 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 /** Single-use, loopback TCP transport. Callbacks run on the selector thread and must not block. */
 public final class NioServer implements AutoCloseable, OutboundSink {
@@ -29,14 +30,27 @@ public final class NioServer implements AutoCloseable, OutboundSink {
     private volatile IOException failure;
     private volatile int localPort = -1;
 
-    /** Starts with no business handlers; valid frames are decoded and discarded. */
+    /** No business handlers: recognized JSON operations receive INVALID_REQUEST. */
     public NioServer() { this(ProtocolLimits.TCP_PORT); }
-    public NioServer(int port) { this(port, (context, message) -> {}, (context, chunk) -> {}); }
+    public NioServer(int port) { this(port, MessageDispatcher.builder(), (context, chunk) -> {}); }
+
+    /** Snapshots startup registrations and wires dispatch errors to this server's outbound queue. */
+    public NioServer(int port, MessageDispatcher.Builder handlers,
+                     BiConsumer<ConnectionContext, FileChunk> chunks) {
+        this(port, sink -> Objects.requireNonNull(handlers).build(sink), chunks);
+    }
+
+    /** Retains the original callback path for custom wiring and transport fixtures. */
     public NioServer(int port, MessageHandler messages,
                      BiConsumer<ConnectionContext, FileChunk> chunks) {
+        this(port, sink -> Objects.requireNonNull(messages), chunks);
+    }
+
+    private NioServer(int port, Function<OutboundSink, MessageHandler> messageFactory,
+                      BiConsumer<ConnectionContext, FileChunk> chunks) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid TCP port");
         this.port = port;
-        this.messages = Objects.requireNonNull(messages);
+        this.messages = messageFactory.apply(this);
         this.chunks = Objects.requireNonNull(chunks);
     }
 
