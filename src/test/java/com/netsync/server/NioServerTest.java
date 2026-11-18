@@ -273,4 +273,161 @@ class NioServerTest {
             assertFalse(server.isRunning());
         }
     }
+
+    private void assertReleased(ConnectionState state) {
+        assertTrue(state.closed);
+        assertFalse(state.key.isValid());
+        assertFalse(state.key.channel().isOpen());
+        assertNull(state.key.attachment());
+        assertNull(state.payload);
+        assertTrue(state.output.isEmpty());
+        assertEquals(0, state.queuedBytes);
+        assertEquals(0, state.prefix.position());
+    }
+
+    @Test void explicitCloseReleasesStateAndRejectsFurtherSends() throws Exception {
+        var reference = new AtomicReference<NioServer>();
+        var states = new LinkedBlockingQueue<ConnectionState>();
+        var results = new LinkedBlockingQueue<Boolean>();
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            NioServer owner = reference.get();
+            boolean queued = owner.send(context.connectionId(), request) == EnqueueResult.ACCEPTED;
+            boolean closed = owner.closeConnection(context.connectionId());
+            results.add(queued && closed && !owner.closeConnection(context.connectionId())
+                    && owner.send(context.connectionId(), request) == EnqueueResult.REJECTED
+                    && context.session().isEmpty());
+            states.add((ConnectionState) context);
+        }, (context, chunk) -> {})) {
+            reference.set(server);
+            server.start();
+            try (Socket client = connect(server)) {
+                client.getOutputStream().write(encode(message()));
+                assertEquals(Boolean.TRUE, results.poll(3, TimeUnit.SECONDS));
+                ConnectionState state = states.poll(3, TimeUnit.SECONDS);
+                assertNotNull(state);
+                assertReleased(state);
+                assertEquals(-1, client.getInputStream().read());
+            }
+        }
+    }
+
+    @Test void abruptResetIsCleanedUpAndHealthyClientContinues() throws Exception {
+        var reference = new AtomicReference<NioServer>();
+        var departed = new AtomicReference<ConnectionState>();
+        var registered = new LinkedBlockingQueue<Boolean>();
+        var results = new LinkedBlockingQueue<EnqueueResult>();
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            if (departed.compareAndSet(null, (ConnectionState) context)) registered.add(true);
+            else results.add(reference.get().send(departed.get().connectionId(), request));
+        }, (context, chunk) -> {})) {
+            reference.set(server);
+            server.start();
+            try (Socket reset = connect(server); Socket healthy = connect(server)) {
+                reset.getOutputStream().write(encode(message()));
+                assertEquals(Boolean.TRUE, registered.poll(3, TimeUnit.SECONDS));
+                reset.setSoLinger(true, 0); // Close with TCP RST rather than orderly EOF.
+                reset.close();
+                // Each request is a selector-thread barrier; reset and healthy readiness can arrive in either order.
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                EnqueueResult result;
+                do {
+                    healthy.getOutputStream().write(encode(message()));
+                    result = results.poll(3, TimeUnit.SECONDS);
+                    assertNotNull(result);
+                } while (result != EnqueueResult.REJECTED && System.nanoTime() < deadline);
+                assertEquals(EnqueueResult.REJECTED, result);
+                assertReleased(departed.get());
+                assertTrue(server.isRunning());
+                assertNull(server.failure());
+            }
+        }
+    }
+
+    @Test void invalidChannelIsCleanedUpWithoutStoppingOtherClients() throws Exception {
+        var states = new LinkedBlockingQueue<ConnectionState>();
+        var healthy = new LinkedBlockingQueue<Boolean>();
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            if (request.type() == MessageType.LOGOUT_REQUEST) {
+                ConnectionState state = (ConnectionState) context;
+                try { state.key.channel().close(); }
+                catch (IOException e) { throw new java.io.UncheckedIOException(e); }
+                states.add(state);
+            } else healthy.add(true);
+        }, (context, chunk) -> {})) {
+            server.start();
+            try (Socket invalid = connect(server); Socket other = connect(server)) {
+                invalid.getOutputStream().write(encode(new MessageEnvelope(1, MessageType.LOGOUT_REQUEST,
+                        UUID.randomUUID(), null, new MessageBody.Empty())));
+                ConnectionState state = states.poll(3, TimeUnit.SECONDS);
+                assertNotNull(state);
+                other.getOutputStream().write(encode(message()));
+                assertEquals(Boolean.TRUE, healthy.poll(3, TimeUnit.SECONDS));
+                assertReleased(state); // The healthy callback runs after the invalid callback's cleanup.
+                assertNull(server.failure());
+            }
+        }
+    }
+
+    @Test void handlerFailureOnlyClosesThatConnection() throws Exception {
+        var received = new LinkedBlockingQueue<Boolean>();
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            if (request.type() == MessageType.LOGOUT_REQUEST) throw new IllegalStateException("private handler data");
+            received.add(true);
+        }, (context, chunk) -> {})) {
+            server.start();
+            try (Socket failing = connect(server); Socket healthy = connect(server)) {
+                failing.getOutputStream().write(encode(new MessageEnvelope(1, MessageType.LOGOUT_REQUEST,
+                        UUID.randomUUID(), null, new MessageBody.Empty())));
+                assertEquals(-1, failing.getInputStream().read());
+                healthy.getOutputStream().write(encode(message()));
+                assertEquals(Boolean.TRUE, received.poll(3, TimeUnit.SECONDS));
+                assertTrue(server.isRunning());
+                assertNull(server.failure());
+            }
+        }
+    }
+
+    @Test void queuedOutputAcrossWriteBudgetsDrainsAndDisablesWriteInterest() throws Exception {
+        var reference = new AtomicReference<NioServer>();
+        var checks = new LinkedBlockingQueue<Boolean>();
+        FileChunk chunk = new FileChunk(UUID.randomUUID(), UUID.randomUUID(), 0,
+                new byte[ProtocolLimits.MAX_CHUNK_BYTES]);
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            ConnectionState state = (ConnectionState) context;
+            if (request.type() == MessageType.LOGOUT_REQUEST) {
+                checks.add(state.output.isEmpty() && state.queuedBytes == 0
+                        && state.key.interestOps() == java.nio.channels.SelectionKey.OP_READ);
+                return;
+            }
+            boolean accepted = true;
+            for (int i = 0; i < 40; i++) {
+                accepted &= reference.get().send(context.connectionId(), chunk) == EnqueueResult.ACCEPTED;
+            }
+            checks.add(accepted);
+        }, (context, frame) -> {})) {
+            reference.set(server);
+            server.start();
+            try (Socket client = connect(server)) {
+                client.getOutputStream().write(encode(message()));
+                assertEquals(Boolean.TRUE, checks.poll(3, TimeUnit.SECONDS));
+                for (int i = 0; i < 40; i++) {
+                    FileChunk decoded = assertInstanceOf(FileChunk.class, readFrame(client));
+                    assertEquals(chunk.messageId(), decoded.messageId());
+                    assertArrayEquals(chunk.data(), decoded.data());
+                }
+                client.getOutputStream().write(encode(new MessageEnvelope(1, MessageType.LOGOUT_REQUEST,
+                        UUID.randomUUID(), null, new MessageBody.Empty())));
+                assertEquals(Boolean.TRUE, checks.poll(3, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    @Test void connectionMutationsRejectCallsOutsideSelectorThread() throws Exception {
+        try (NioServer server = new NioServer(0)) {
+            server.start();
+            assertThrows(IllegalStateException.class, () -> server.send(UUID.randomUUID(), message()));
+            assertThrows(IllegalStateException.class, () -> server.closeConnection(UUID.randomUUID()));
+            assertTrue(server.isRunning());
+        }
+    }
 }
