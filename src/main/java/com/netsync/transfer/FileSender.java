@@ -105,6 +105,9 @@ public final class FileSender implements AutoCloseable {
         Objects.requireNonNull(recipientClientId, "Recipient client ID must not be null");
         Objects.requireNonNull(sourceFile, "Source file must not be null");
 
+        MessageEnvelope offerEnvelope;
+        CompletableFuture<FileTransferResult> future;
+
         synchronized (stateLock) {
             if (isActive()) {
                 throw new IllegalStateException("A transfer is already active for this sender: " + transferId);
@@ -138,21 +141,22 @@ public final class FileSender implements AutoCloseable {
             this.pendingChunkMessageId = null;
             this.completeMessageId = null;
             this.completionFuture = new CompletableFuture<>();
+            future = this.completionFuture;
 
             this.offerMessageId = UUID.randomUUID();
             this.state = SenderState.OFFERING;
 
-            MessageEnvelope offerEnvelope = new MessageEnvelope(
+            offerEnvelope = new MessageEnvelope(
                     ProtocolLimits.VERSION,
                     MessageType.FILE_OFFER,
                     offerMessageId,
                     null,
                     new MessageBody.FileOffer(recipientClientId, fileName, size)
             );
-            frameSink.accept(offerEnvelope);
-
-            return completionFuture;
         }
+
+        frameSink.accept(offerEnvelope);
+        return future;
     }
 
     /**
@@ -281,6 +285,9 @@ public final class FileSender implements AutoCloseable {
      * Executed strictly on worker pool threads.
      */
     private void readAndSendNextChunk() {
+        OutboundFrame frameToSend = null;
+        FileTransferProgress progress = null;
+
         synchronized (stateLock) {
             if (state != SenderState.SENDING_CHUNKS) {
                 return;
@@ -291,7 +298,7 @@ public final class FileSender implements AutoCloseable {
                     // Empty file handling: 0 chunks, SHA-256 of empty bytes
                     finalSha256 = TransferChecksum.EMPTY_SHA256;
                     completeMessageId = UUID.randomUUID();
-                    MessageEnvelope completeEnvelope = new MessageEnvelope(
+                    frameToSend = new MessageEnvelope(
                             ProtocolLimits.VERSION,
                             MessageType.FILE_COMPLETE,
                             completeMessageId,
@@ -299,73 +306,73 @@ public final class FileSender implements AutoCloseable {
                             new MessageBody.FileComplete(transferId, 0, finalSha256)
                     );
                     state = SenderState.AWAITING_COMPLETE_ACK;
-                    frameSink.accept(completeEnvelope);
-                    return;
-                }
-
-                if (inputStream == null) {
-                    inputStream = Files.newInputStream(sourceFile);
-                    incrementalChecksum = new TransferChecksum.Incremental();
-                    chunkSequence = 0;
-                    bytesSent = 0;
-                }
-
-                byte[] buffer = new byte[ProtocolLimits.MAX_CHUNK_BYTES];
-                int bytesRead = inputStream.read(buffer);
-
-                if (bytesRead > 0) {
-                    byte[] chunkData = (bytesRead == buffer.length) ? buffer : Arrays.copyOf(buffer, bytesRead);
-                    incrementalChecksum.update(chunkData);
-
-                    pendingChunkMessageId = UUID.randomUUID();
-                    FileChunk chunk = new FileChunk(pendingChunkMessageId, transferId, chunkSequence, chunkData);
-
-                    chunkSequence++;
-                    bytesSent += bytesRead;
-                    state = SenderState.AWAITING_CHUNK_ACK;
-
-                    frameSink.accept(chunk);
-
-                    if (progressListener != null) {
-                        try {
-                            progressListener.accept(new FileTransferProgress(transferId, bytesSent, fileSizeBytes, chunkSequence - 1));
-                        } catch (Exception ignored) {
-                        }
-                    }
                 } else {
-                    // EOF reached
-                    cleanupStreams();
-                    finalSha256 = incrementalChecksum.digestHex();
-                    completeMessageId = UUID.randomUUID();
-                    MessageEnvelope completeEnvelope = new MessageEnvelope(
-                            ProtocolLimits.VERSION,
-                            MessageType.FILE_COMPLETE,
-                            completeMessageId,
-                            null,
-                            new MessageBody.FileComplete(transferId, chunkSequence, finalSha256)
-                    );
-                    state = SenderState.AWAITING_COMPLETE_ACK;
-                    frameSink.accept(completeEnvelope);
+                    if (inputStream == null) {
+                        inputStream = Files.newInputStream(sourceFile);
+                        incrementalChecksum = new TransferChecksum.Incremental();
+                        chunkSequence = 0;
+                        bytesSent = 0;
+                    }
+
+                    byte[] buffer = new byte[ProtocolLimits.MAX_CHUNK_BYTES];
+                    int bytesRead = inputStream.read(buffer);
+
+                    if (bytesRead > 0) {
+                        byte[] chunkData = (bytesRead == buffer.length) ? buffer : Arrays.copyOf(buffer, bytesRead);
+                        incrementalChecksum.update(chunkData);
+
+                        pendingChunkMessageId = UUID.randomUUID();
+                        frameToSend = new FileChunk(pendingChunkMessageId, transferId, chunkSequence, chunkData);
+
+                        chunkSequence++;
+                        bytesSent += bytesRead;
+                        state = SenderState.AWAITING_CHUNK_ACK;
+
+                        if (progressListener != null) {
+                            progress = new FileTransferProgress(transferId, bytesSent, fileSizeBytes, chunkSequence - 1);
+                        }
+                    } else {
+                        // EOF reached
+                        cleanupStreams();
+                        finalSha256 = incrementalChecksum.digestHex();
+                        completeMessageId = UUID.randomUUID();
+                        frameToSend = new MessageEnvelope(
+                                ProtocolLimits.VERSION,
+                                MessageType.FILE_COMPLETE,
+                                completeMessageId,
+                                null,
+                                new MessageBody.FileComplete(transferId, chunkSequence, finalSha256)
+                        );
+                        state = SenderState.AWAITING_COMPLETE_ACK;
+                    }
                 }
             } catch (IOException | RuntimeException e) {
                 cleanupStreams();
                 state = SenderState.FAILED;
                 if (transferId != null) {
-                    try {
-                        frameSink.accept(new MessageEnvelope(
-                                ProtocolLimits.VERSION,
-                                MessageType.FILE_CANCEL,
-                                UUID.randomUUID(),
-                                null,
-                                new MessageBody.TransferReference(transferId)
-                        ));
-                    } catch (Exception ignored) {
-                    }
+                    frameToSend = new MessageEnvelope(
+                            ProtocolLimits.VERSION,
+                            MessageType.FILE_CANCEL,
+                            UUID.randomUUID(),
+                            null,
+                            new MessageBody.TransferReference(transferId)
+                    );
                 }
                 if (completionFuture != null) {
                     completionFuture.complete(FileTransferResult.failed(transferId, "Read error: " + e.getMessage()));
                 }
             }
+        }
+
+        if (progress != null && progressListener != null) {
+            try {
+                progressListener.accept(progress);
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (frameToSend != null) {
+            frameSink.accept(frameToSend);
         }
     }
 
@@ -373,30 +380,39 @@ public final class FileSender implements AutoCloseable {
      * Cancels the active transfer.
      */
     public void cancel() {
+        OutboundFrame cancelFrame = null;
+        CompletableFuture<FileTransferResult> future = null;
+        UUID tid;
+
         synchronized (stateLock) {
             if (!isActive()) {
                 return;
             }
 
             cleanupStreams();
-            UUID tid = transferId;
+            tid = transferId;
             state = SenderState.CANCELLED;
+            future = completionFuture;
 
             if (tid != null) {
-                try {
-                    frameSink.accept(new MessageEnvelope(
-                            ProtocolLimits.VERSION,
-                            MessageType.FILE_CANCEL,
-                            UUID.randomUUID(),
-                            null,
-                            new MessageBody.TransferReference(tid)
-                    ));
-                } catch (Exception ignored) {
-                }
+                cancelFrame = new MessageEnvelope(
+                        ProtocolLimits.VERSION,
+                        MessageType.FILE_CANCEL,
+                        UUID.randomUUID(),
+                        null,
+                        new MessageBody.TransferReference(tid)
+                );
             }
+        }
 
-            if (completionFuture != null) {
-                completionFuture.complete(FileTransferResult.cancelled(tid, "Cancelled by sender"));
+        if (future != null) {
+            future.complete(FileTransferResult.cancelled(tid, "Cancelled by sender"));
+        }
+
+        if (cancelFrame != null) {
+            try {
+                frameSink.accept(cancelFrame);
+            } catch (Exception ignored) {
             }
         }
     }

@@ -58,12 +58,12 @@ class ClientFileTransferTest {
         private final UUID recipientClientId = UUID.randomUUID();
         private FileSender sender;
         private FileReceiver receiver;
-        private UUID currentTransferId;
-        private boolean autoAccept = true;
-        private boolean corruptChecksum = false;
-        private boolean duplicateFirstChunk = false;
-        private boolean dropChunks = false;
-        private boolean firstChunkSeen = false;
+        private volatile UUID currentTransferId;
+        private volatile boolean autoAccept = true;
+        private volatile boolean corruptChecksum = false;
+        private volatile boolean duplicateFirstChunk = false;
+        private volatile boolean dropChunks = false;
+        private final java.util.concurrent.atomic.AtomicBoolean firstChunkSeen = new java.util.concurrent.atomic.AtomicBoolean(false);
 
         void setSender(FileSender sender) {
             this.sender = sender;
@@ -111,19 +111,7 @@ class ClientFileTransferTest {
                     case FILE_COMPLETE -> {
                         MessageBody.FileComplete complete = (MessageBody.FileComplete) envelope.body();
 
-                        // 1. Send ACK(FILE_COMPLETE) to sender
-                        if (sender != null) {
-                            MessageEnvelope ackComplete = new MessageEnvelope(
-                                    ProtocolLimits.VERSION,
-                                    MessageType.ACK,
-                                    UUID.randomUUID(),
-                                    envelope.messageId(),
-                                    new MessageBody.Ack(MessageType.FILE_COMPLETE, AckStatus.ACCEPTED, complete.transferId())
-                            );
-                            sender.handleControl(ackComplete);
-                        }
-
-                        // 2. Forward FILE_COMPLETE to receiver (optionally with corrupted hash)
+                        // 1. Forward FILE_COMPLETE to receiver (optionally with corrupted hash)
                         if (receiver != null) {
                             String hashToSend = corruptChecksum
                                     ? "0000000000000000000000000000000000000000000000000000000000000000"
@@ -137,6 +125,18 @@ class ClientFileTransferTest {
                                     new MessageBody.FileComplete(complete.transferId(), complete.chunkCount(), hashToSend)
                             );
                             receiver.handleControl(completeForward);
+                        }
+
+                        // 2. Send ACK(FILE_COMPLETE) to sender
+                        if (sender != null) {
+                            MessageEnvelope ackComplete = new MessageEnvelope(
+                                    ProtocolLimits.VERSION,
+                                    MessageType.ACK,
+                                    UUID.randomUUID(),
+                                    envelope.messageId(),
+                                    new MessageBody.Ack(MessageType.FILE_COMPLETE, AckStatus.ACCEPTED, complete.transferId())
+                            );
+                            sender.handleControl(ackComplete);
                         }
                     }
                     case FILE_CANCEL -> {
@@ -159,7 +159,18 @@ class ClientFileTransferTest {
                     return; // simulate network loss
                 }
 
-                // 1. Send ACK(FILE_CHUNK, STORED) to sender
+                // 1. Forward chunk to receiver with fresh UUID first
+                if (receiver != null) {
+                    FileChunk forwardedChunk = new FileChunk(UUID.randomUUID(), chunk.transferId(), chunk.sequence(), chunk.data());
+                    receiver.handleChunk(forwardedChunk);
+
+                    if (duplicateFirstChunk && chunk.sequence() == 0 && firstChunkSeen.compareAndSet(false, true)) {
+                        // Inject duplicate chunk
+                        receiver.handleChunk(forwardedChunk);
+                    }
+                }
+
+                // 2. Send ACK(FILE_CHUNK, STORED) to sender
                 if (sender != null) {
                     MessageEnvelope ackChunk = new MessageEnvelope(
                             ProtocolLimits.VERSION,
@@ -169,18 +180,6 @@ class ClientFileTransferTest {
                             new MessageBody.Ack(MessageType.FILE_CHUNK, AckStatus.STORED, chunk.transferId())
                     );
                     sender.handleControl(ackChunk);
-                }
-
-                // 2. Forward chunk to receiver with fresh UUID
-                if (receiver != null) {
-                    FileChunk forwardedChunk = new FileChunk(UUID.randomUUID(), chunk.transferId(), chunk.sequence(), chunk.data());
-                    receiver.handleChunk(forwardedChunk);
-
-                    if (duplicateFirstChunk && !firstChunkSeen && chunk.sequence() == 0) {
-                        firstChunkSeen = true;
-                        // Inject duplicate chunk
-                        receiver.handleChunk(forwardedChunk);
-                    }
                 }
             }
         }
