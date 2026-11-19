@@ -8,21 +8,29 @@ import java.nio.channels.*;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
+import java.util.function.Consumer;
 
 /** Single-use, loopback TCP transport. Callbacks run on the selector thread and must not block. */
 public final class NioServer implements AutoCloseable, OutboundSink {
     private static final System.Logger LOG = System.getLogger(NioServer.class.getName());
     private static final int FRAME_BUDGET = 32;
     private static final int BYTE_BUDGET = 256 * 1024;
+    private static final int TASK_BUDGET = 32;
     private final int port;
     private final MessageHandler messages;
     private final BiConsumer<ConnectionContext, FileChunk> chunks;
     private final FrameCodec codec = new FrameCodec(new MessageCodec());
     private final Map<UUID, ConnectionState> connections = new HashMap<>();
+    private final Set<Consumer<UUID>> disconnectListeners = new LinkedHashSet<>();
+    private final SelectorTaskQueue tasks = new SelectorTaskQueue(ProtocolLimits.SELECTOR_QUEUE_SIZE,
+            () -> { if (this.selector != null) this.selector.wakeup(); });
+    private SessionRegistry sessions;
     private Selector selector;
     private ServerSocketChannel listener;
     private Thread thread;
@@ -54,9 +62,36 @@ public final class NioServer implements AutoCloseable, OutboundSink {
         this.chunks = Objects.requireNonNull(chunks);
     }
 
+    /**
+     * Startup-only injection. Lookups must be fast, non-blocking, thread-safe memory lookups;
+     * database/network access, credential work and waits are not permitted here.
+     * Core does not create, authenticate, cache or revoke sessions.
+     */
+    public synchronized NioServer withSessionRegistry(SessionRegistry sessions) {
+        requireConfigurable();
+        this.sessions = Objects.requireNonNull(sessions);
+        return this;
+    }
+
+    /** Startup-only registration. Called after transport cleanup, once per connection, on the selector thread. */
+    public synchronized NioServer addDisconnectListener(Consumer<UUID> listener) {
+        requireConfigurable();
+        if (!disconnectListeners.add(Objects.requireNonNull(listener))) {
+            throw new IllegalArgumentException("Disconnect listener already registered");
+        }
+        return this;
+    }
+
+    private void requireConfigurable() {
+        if (thread != null || tasks.isShutdown()) throw new IllegalStateException("Server already started or closed");
+    }
+
+    /** Background threads submit here; task bodies execute on the selector and must not block. */
+    public SelectorTaskQueue selectorTasks() { return tasks; }
+
     /** Returns only after binding succeeds. Port zero requests an ephemeral test port. */
     public synchronized void start() throws IOException {
-        if (thread != null) throw new IllegalStateException("Server is single-use");
+        requireConfigurable();
         try {
             selector = Selector.open();
             listener = ServerSocketChannel.open();
@@ -66,9 +101,11 @@ public final class NioServer implements AutoCloseable, OutboundSink {
             localPort = ((InetSocketAddress) listener.getLocalAddress()).getPort();
             running = true;
             thread = new Thread(this::runLoop, "netsync-tcp-selector");
+            tasks.start(thread);
             thread.start();
         } catch (IOException | RuntimeException e) {
             running = false;
+            tasks.beginShutdown();
             cleanup();
             throw e;
         }
@@ -82,7 +119,10 @@ public final class NioServer implements AutoCloseable, OutboundSink {
     private void runLoop() {
         try {
             while (running) {
-                selector.select(1000); // Blocks until readiness, shutdown wakeup, or timeout maintenance.
+                // Never block with queued work; still poll sockets between finite task batches.
+                if (tasks.hasTasks()) selector.selectNow();
+                else selector.select(1000);
+                tasks.runTasks(TASK_BUDGET);
                 var keys = selector.selectedKeys().iterator();
                 while (running && keys.hasNext()) {
                     SelectionKey key = keys.next();
@@ -124,7 +164,8 @@ public final class NioServer implements AutoCloseable, OutboundSink {
             logFailure(System.Logger.Level.ERROR, "TCP selector failed", e);
         } finally {
             running = false;
-            cleanup();
+            try { tasks.finishShutdown(); }
+            finally { cleanup(); }
         }
     }
 
@@ -139,7 +180,7 @@ public final class NioServer implements AutoCloseable, OutboundSink {
                 }
                 channel.configureBlocking(false);
                 SelectionKey key = channel.register(selector, SelectionKey.OP_READ);
-                ConnectionState state = new ConnectionState(key);
+                ConnectionState state = new ConnectionState(key, sessions);
                 key.attach(state);
                 connections.put(state.connectionId(), state);
             } catch (IOException | RuntimeException e) {
@@ -273,6 +314,12 @@ public final class NioServer implements AutoCloseable, OutboundSink {
         state.queuedBytes = 0;
         state.payload = null;
         state.prefix.clear();
+        for (Consumer<UUID> listener : disconnectListeners) {
+            try { listener.accept(state.connectionId()); }
+            catch (RuntimeException e) {
+                logFailure(System.Logger.Level.WARNING, "Disconnect listener failed", e);
+            }
+        }
     }
 
     private void cleanup() {
@@ -291,11 +338,12 @@ public final class NioServer implements AutoCloseable, OutboundSink {
         LOG.log(level, operation + " (" + error.getClass().getName() + ")");
     }
 
-    /** Stops accepting and closes all clients; no application work needs draining in this milestone. */
+    /** Reject new tasks, finish accepted selector tasks, then close clients without draining socket output. */
     @Override public void close() {
         Thread loop;
         synchronized (this) {
             running = false;
+            tasks.beginShutdown();
             loop = thread;
             if (selector != null) selector.wakeup();
         }
