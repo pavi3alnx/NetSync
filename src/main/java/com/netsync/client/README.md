@@ -1,0 +1,180 @@
+# NetSync client integration
+
+The client core contains transport, dispatch, session access and an extensible CLI.
+It does not implement authentication, chat routing, UDP heartbeats or file transfer
+business logic. It reuses all shared wire models and codecs without changes.
+
+## Start the CLI (PowerShell, from the repository root)
+
+```powershell
+mvn -B compile dependency:build-classpath "-Dmdep.outputFile=target/client-classpath.txt"
+$clientClasspath = "target/classes;" + (Get-Content -Raw target/client-classpath.txt).Trim()
+java -cp $clientClasspath com.netsync.client.NetSyncClient
+```
+
+Example commands:
+
+```text
+/help
+/connect
+/status
+/disconnect
+/connect 127.0.0.1 5050
+/quit
+```
+
+Default: `127.0.0.1:5050`. The server must be started separately. EOF and `/quit`
+close the client. Input/output streams remain caller-owned. CLI input executes on
+the caller thread. Incoming messages display only type and ID, never body fields,
+passwords or tokens. Binary frames require an actual file-module receiver.
+
+## Transport and outbound API
+
+```java
+new TcpClient(); // 256 outgoing frames, 1 MiB outgoing bytes, 256 dispatch tasks
+new TcpClient(int outputFrames, int outputBytes, int dispatchCapacity);
+void connect() throws IOException;
+void connect(String host, int port) throws IOException;
+void disconnect();
+void close();
+boolean isConnected();
+TcpClient.State state();
+TcpClient.Failure failure();
+Optional<UUID> connectionId();
+EnqueueResult send(OutboundFrame frame) throws ProtocolException;
+EnqueueResult sendJson(MessageEnvelope message) throws ProtocolException;
+EnqueueResult sendChunk(FileChunk chunk) throws ProtocolException;
+void sendOrThrow(OutboundFrame frame);
+long protocolRejections();
+ClientDispatcher dispatcher();
+```
+
+`ClientOutbound` exposes `send`, `sendJson`, `sendChunk`, `sendOrThrow` and
+`isConnected`. ACCEPTED means enqueued, not delivered. Invalid outbound models
+throw the shared ProtocolException. Disconnected clients and full output queues
+return REJECTED. `sendOrThrow` adapts to existing transfer module Consumers:
+rejection throws RejectedExecutionException, invalid models IllegalArgumentException.
+There is no automatic retry or replay.
+
+Concurrent sends are serialized in enqueue order. Both output limits include the
+frame currently being written. Blocking OutputStream.write completes all requested
+bytes or throws: partial kernel writes are handled by the Java socket stream.
+The reader separately accumulates prefix, kind and body, validates sizes before
+allocation and kind bounds immediately, and decodes through FrameCodec. It handles
+fragmented and coalesced frames, discards incomplete EOF tails, and times out a
+partial frame after 15 seconds without progress. Idle connections have no read
+expiry. Recoverable shared-codec errors skip that frame and increment
+`protocolRejections`; fatal malformed input closes with INVALID_FRAME.
+
+Lifecycle is DISCONNECTED -> CONNECTING -> CONNECTED -> DISCONNECTED; CLOSED is
+terminal. Connect is synchronous with a five-second socket-connect timeout (host
+name resolution uses the platform resolver). Concurrent/duplicate attempts are
+rejected. Disconnect/close can cancel a connection attempt by closing its socket.
+Reconnect creates a fresh local connection UUID and clears the old session.
+Failures are safe enum values, with no raw payload or exception diagnostics.
+
+## Dispatch registration
+
+```java
+ClientDispatcher.Registration register(MessageType type, Consumer<MessageEnvelope> handler);
+ClientDispatcher.Registration registerBinary(Consumer<FileChunk> handler);
+long unhandledMessages();
+long handlerFailures();
+```
+
+These methods are on `client.dispatcher()`. Registration.close() is idempotent.
+Different handlers for a type run in registration order. Registering the identical
+Consumer object twice for the same type/binary route is rejected. FILE_CHUNK cannot
+be registered on the JSON route. A registration closed before invocation is skipped;
+an invocation already starting/running may finish. Dispatcher.close() removes all
+registrations and rejects new ones. Handlers may close the client safely.
+
+One serial dispatch worker preserves mixed JSON/binary receive order. Handler
+RuntimeExceptions increment `handlerFailures` and do not prevent other handlers
+from running. Unhandled JSON increments `unhandledMessages`. Binary frames without
+an active receiver close with NO_BINARY_HANDLER. Both counters are cumulative.
+
+The dispatch queue holds at most the configured pending task count plus one running
+callback task. It shares capacity across JSON and binary to preserve protocol order.
+Slow callbacks never block socket reads; saturation closes with DISPATCH_FULL rather
+than dropping an arbitrary frame and continuing a corrupted transfer. The current
+callback may finish. Module callbacks should be bounded, cooperate with interruption,
+and offload expensive disk work to their own bounded worker infrastructure.
+
+There are at most three client threads: one reader, one writer and one dispatch
+worker. Disconnect closes the socket, clears queued output/session state and joins
+I/O threads with bounded waits. Reconnect refuses while old I/O threads are alive.
+Orderly remote EOF retains already complete queued inbound frames. Explicit local
+disconnect, reconnect, fatal errors and overload cancel pending old inbound work.
+An already running callback may finish; asynchronous module work must retain and
+recheck its connection UUID before sending or publishing results. Disconnect and
+close do not promise output draining or delivery. Close interrupts dispatch work,
+waits up to two seconds except when called by its own worker, and is idempotent.
+All client threads are daemon threads; Java cannot forcibly terminate a module
+callback that ignores interruption. Modules own cleanup of their workers/transfers.
+
+## Session access (security-owned authentication)
+
+```java
+Optional<SessionView> session();
+void supplySession(UUID connectionId, SessionView session);
+void clearSession();
+```
+
+Use the existing shared immutable SessionView. Security supplies the identity only
+after its own successful authentication. Both the supplied UUID and the snapshot's
+connectionId must equal the current local connection UUID. This is a local
+client-generation ID, not the server's internal connection ID. Session access is
+synchronized and empty after disconnect/close. Old generations cannot repopulate it.
+No authentication decisions, password storage, tokens or credential verification
+are implemented here. Security retains ownership of presence credentials separately.
+
+## CLI extension API
+
+```java
+NetSyncClient cli = new NetSyncClient(client, outputWriter);
+cli.commands().register("/msg", "/msg recipient text", "Send a chat message", args -> {
+    // Chat owner implements validation and sending here.
+});
+cli.run(inputReader);
+```
+
+`CommandRegistry.register(String name, String usage, String summary, Command command)`
+rejects duplicate names. Command.execute(List<String> arguments) may throw Exception.
+`CommandRegistry.parse(String)` supports whitespace, single/double quotes, empty
+quoted arguments, and backslash escaping. Unclosed quotes/escapes are rejected.
+Command names are case-sensitive slash-prefixed lowercase names. Descriptions are
+immutable snapshots. Unknown/malformed commands do not terminate the interactive
+loop. Module exceptions are rendered generically so arbitrary error text does not
+leak credentials. InputException is an opt-in safe user-facing error; never include
+secrets in it. Backslashes escape the following character, so Windows paths need
+escaped backslashes (or forward slashes).
+
+## Module wiring examples
+
+```java
+// Sachin: independent inbound subscription and outbound controls.
+var chatRegistration = client.dispatcher().register(MessageType.CHAT_DELIVER, chatHandler);
+ClientOutbound outbound = client;
+
+// Shalini: register authentication response handler; supplySession after validation.
+var loginRegistration = client.dispatcher().register(MessageType.LOGIN_RESPONSE, loginHandler);
+
+// Gayangi: register presence handlers and inspect isConnected/session/connectionId.
+var presenceRegistration = client.dispatcher().register(MessageType.PRESENCE_UPDATE, presenceHandler);
+
+// Pajas: existing file services accept a Consumer<OutboundFrame>.
+// new FileSender(client::sendOrThrow);
+// new FileReceiver(client::sendOrThrow, ...);
+var chunkRegistration = client.dispatcher().registerBinary(receiver::handleChunk);
+var fileRegistration = client.dispatcher().register(MessageType.FILE_OFFERED, receiver::handleControl);
+// Register other required transfer control types in the same way.
+```
+
+Register handlers before connecting/sending. Retain and close registration handles
+when a module shuts down. Core does not automatically instantiate module services or
+register future `/login`, `/logout`, `/users`, `/msg`, `/sendfile`, `/accept`, `/reject`
+commands. TLS and UDP are outside this core; the CLI warns about unencrypted demo
+transport. Use disposable local credentials only until security supplies a protected
+transport. The CLI's metadata display is intentionally minimal; modules may render
+safe business information through their own handlers.
