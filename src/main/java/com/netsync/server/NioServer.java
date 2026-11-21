@@ -13,11 +13,15 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
-import java.util.function.Function;
 import java.util.function.Consumer;
 
 /** Single-use, loopback TCP transport. Callbacks run on the selector thread and must not block. */
-public final class NioServer implements AutoCloseable, OutboundSink {
+public final class NioServer implements AutoCloseable, OutboundSink, ConnectionCloser {
+    @FunctionalInterface
+    public interface HandlerFactory {
+        MessageHandler create(NioServer server);
+    }
+
     private static final System.Logger LOG = System.getLogger(NioServer.class.getName());
     private static final int FRAME_BUDGET = 32;
     private static final int BYTE_BUDGET = 256 * 1024;
@@ -45,20 +49,25 @@ public final class NioServer implements AutoCloseable, OutboundSink {
     /** Snapshots startup registrations and wires dispatch errors to this server's outbound queue. */
     public NioServer(int port, MessageDispatcher.Builder handlers,
                      BiConsumer<ConnectionContext, FileChunk> chunks) {
-        this(port, sink -> Objects.requireNonNull(handlers).build(sink), chunks);
+        this(port, server -> Objects.requireNonNull(handlers).build(server), chunks);
     }
 
     /** Retains the original callback path for custom wiring and transport fixtures. */
     public NioServer(int port, MessageHandler messages,
                      BiConsumer<ConnectionContext, FileChunk> chunks) {
-        this(port, sink -> Objects.requireNonNull(messages), chunks);
+        this(port, server -> Objects.requireNonNull(messages), chunks);
     }
 
-    private NioServer(int port, Function<OutboundSink, MessageHandler> messageFactory,
-                      BiConsumer<ConnectionContext, FileChunk> chunks) {
+    /**
+     * Builds handlers before start with access to this server's outbound sink,
+     * Selector task queue, session registry hook, disconnect listeners and close control.
+     */
+    public NioServer(int port, HandlerFactory handlerFactory,
+                     BiConsumer<ConnectionContext, FileChunk> chunks) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid TCP port");
         this.port = port;
-        this.messages = messageFactory.apply(this);
+        this.messages = Objects.requireNonNull(handlerFactory).create(this);
+        Objects.requireNonNull(this.messages, "Handler factory returned null");
         this.chunks = Objects.requireNonNull(chunks);
     }
 
@@ -296,6 +305,23 @@ public final class NioServer implements AutoCloseable, OutboundSink {
         ConnectionState state = connections.get(connectionId);
         if (state == null) return false;
         disconnect(state);
+        return true;
+    }
+
+    /** Closes a connection after all currently queued output has been written. */
+    @Override public boolean closeAfterDrain(UUID connectionId) {
+        requireSelectorThread();
+        ConnectionState state = connections.get(connectionId);
+        if (state == null) return false;
+        if (state.closing) return true;
+        state.closing = true;
+        if (!state.key.isValid()) {
+            disconnect(state);
+        } else if (state.output.isEmpty()) {
+            disconnect(state);
+        } else {
+            state.key.interestOps(SelectionKey.OP_WRITE);
+        }
         return true;
     }
 
