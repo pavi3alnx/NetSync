@@ -255,12 +255,15 @@ class NioServerTest {
     @Test void coalescedFramesBeyondReadBudgetAreEventuallyDispatched() throws Exception {
         var queue = new LinkedBlockingQueue<Received>();
         try (NioServer server = server(queue); Socket client = connect(server)) {
-            MessageEnvelope request = message();
-            byte[] encoded = encode(request);
+            var requests = new java.util.ArrayList<MessageEnvelope>();
             var bytes = new java.io.ByteArrayOutputStream();
-            for (int i = 0; i < 100; i++) bytes.write(encoded);
+            for (int i = 0; i < 100; i++) {
+                MessageEnvelope request = message();
+                requests.add(request);
+                bytes.write(encode(request));
+            }
             client.getOutputStream().write(bytes.toByteArray());
-            for (int i = 0; i < 100; i++) assertEquals(request, next(queue).frame());
+            for (MessageEnvelope request : requests) assertEquals(request, next(queue).frame());
         }
     }
 

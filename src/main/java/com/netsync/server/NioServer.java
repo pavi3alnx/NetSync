@@ -14,6 +14,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /** Single-use, loopback TCP transport. Callbacks run on the selector thread and must not block. */
 public final class NioServer implements AutoCloseable, OutboundSink, ConnectionCloser {
@@ -27,6 +28,7 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
     private static final int BYTE_BUDGET = 256 * 1024;
     private static final int TASK_BUDGET = 32;
     private final int port;
+    private final LongSupplier nanoTime;
     private final MessageHandler messages;
     private final BiConsumer<ConnectionContext, FileChunk> chunks;
     private final FrameCodec codec = new FrameCodec(new MessageCodec());
@@ -64,8 +66,15 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
      */
     public NioServer(int port, HandlerFactory handlerFactory,
                      BiConsumer<ConnectionContext, FileChunk> chunks) {
+        this(port, handlerFactory, chunks, System::nanoTime);
+    }
+
+    /** Package-private monotonic clock seam; production deadlines remain unchanged. */
+    NioServer(int port, HandlerFactory handlerFactory,
+              BiConsumer<ConnectionContext, FileChunk> chunks, LongSupplier nanoTime) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid TCP port");
         this.port = port;
+        this.nanoTime = Objects.requireNonNull(nanoTime);
         this.messages = Objects.requireNonNull(handlerFactory).create(this);
         Objects.requireNonNull(this.messages, "Handler factory returned null");
         this.chunks = Objects.requireNonNull(chunks);
@@ -131,6 +140,8 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
                 // Never block with queued work; still poll sockets between finite task batches.
                 if (tasks.hasTasks()) selector.selectNow();
                 else selector.select(1000);
+                // Check idle clients too, before queued work or newly readable frames.
+                checkTimeouts();
                 tasks.runTasks(TASK_BUDGET);
                 var keys = selector.selectedKeys().iterator();
                 while (running && keys.hasNext()) {
@@ -156,13 +167,7 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
                         disconnect(state);
                     }
                 }
-                long now = System.nanoTime();
-                for (ConnectionState state : connections.values().toArray(ConnectionState[]::new)) {
-                    if ((state.payload != null || state.prefix.position() > 0 || state.closing)
-                            && now - state.lastProgress >= TimeUnit.SECONDS.toNanos(ProtocolLimits.FRAME_TIMEOUT_SECONDS)) {
-                        disconnect(state);
-                    }
-                }
+                checkTimeouts();
             }
         } catch (IOException e) {
             failure = e;
@@ -178,6 +183,28 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
         }
     }
 
+    private void checkTimeouts() {
+        long now = nanoTime.getAsLong();
+        for (ConnectionState state : connections.values().toArray(ConnectionState[]::new)) {
+            if (loginExpired(state, now)
+                    || ((state.payload != null || state.prefix.position() > 0 || state.closing)
+                    && now - state.lastProgress >= TimeUnit.SECONDS.toNanos(ProtocolLimits.FRAME_TIMEOUT_SECONDS))) {
+                disconnect(state);
+            }
+        }
+    }
+
+    /**
+     * Live registry state is authoritative; no cached authentication flag is kept.
+     * SessionView has no creation timestamp: a session visible at this check wins
+     * the boundary race. Disconnect hooks cancel pending security work; a late
+     * callback cannot reopen a removed transport or enqueue output to it.
+     */
+    private boolean loginExpired(ConnectionState state, long now) {
+        return now - state.acceptedAt >= TimeUnit.SECONDS.toNanos(ProtocolLimits.LOGIN_TIMEOUT_SECONDS)
+                && state.session().isEmpty();
+    }
+
     private void accept() throws IOException {
         for (int i = 0; i < FRAME_BUDGET; i++) {
             SocketChannel channel = listener.accept();
@@ -189,7 +216,7 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
                 }
                 channel.configureBlocking(false);
                 SelectionKey key = channel.register(selector, SelectionKey.OP_READ);
-                ConnectionState state = new ConnectionState(key, sessions);
+                ConnectionState state = new ConnectionState(key, sessions, nanoTime.getAsLong());
                 key.attach(state);
                 connections.put(state.connectionId(), state);
             } catch (IOException | RuntimeException e) {
@@ -202,6 +229,7 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
     private void read(ConnectionState state) throws IOException {
         SocketChannel channel = (SocketChannel) state.key.channel();
         for (int frames = 0, bytes = 0; frames < FRAME_BUDGET && bytes < BYTE_BUDGET;) {
+            if (loginExpired(state, nanoTime.getAsLong())) { disconnect(state); return; }
             ByteBuffer target = state.payload == null ? state.prefix : state.payload;
             // Read the kind separately so invalid kind/length pairs fail immediately.
             boolean kind = state.payload != null && target.position() == 0;
@@ -213,7 +241,7 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
             if (count < 0) { disconnect(state); return; }
             if (count == 0) return;
             bytes += count;
-            state.lastProgress = System.nanoTime();
+            state.lastProgress = nanoTime.getAsLong();
             try {
                 if (kind) codec.validateKindLength(target.get(0), target.capacity());
                 if (target.hasRemaining()) continue;
@@ -227,7 +255,14 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
                     state.payload = null;
                     frames++;
                     OutboundFrame frame = codec.decodePayload(target);
-                    if (frame instanceof MessageEnvelope message) messages.handle(state, message);
+                    if (frame instanceof MessageEnvelope message) {
+                        // Only fully decoded envelopes consume IDs, including application errors.
+                        if (!state.acceptJsonId(message.messageId())) {
+                            throw new ProtocolException(ErrorCode.DUPLICATE_MESSAGE, message.messageId(),
+                                    ProtocolException.Action.KEEP_OPEN);
+                        }
+                        messages.handle(state, message);
+                    }
                     else chunks.accept(state, (FileChunk) frame);
                     if (!state.key.isValid()) { disconnect(state); return; }
                     if (state.closing) return;
@@ -337,6 +372,7 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
         state.key.attach(null);
         closeQuietly(state.key.channel());
         state.output.clear();
+        state.recentJsonIds.clear();
         state.queuedBytes = 0;
         state.payload = null;
         state.prefix.clear();
