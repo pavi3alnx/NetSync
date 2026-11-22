@@ -41,6 +41,7 @@ public final class FileTransferClientService implements Closeable {
     private volatile FileTransferEventListener eventListener;
     private FileSender activeSender;
     private FileReceiver activeReceiver;
+    private boolean senderStarting;
     private boolean closed;
 
     /**
@@ -123,6 +124,7 @@ public final class FileTransferClientService implements Closeable {
                 }
             });
             this.activeSender = sender;
+            this.senderStarting = true;
         }
 
         CompletableFuture<FileTransferResult> future;
@@ -135,6 +137,10 @@ public final class FileTransferClientService implements Closeable {
                 }
             }
             throw e;
+        } finally {
+            synchronized (lock) {
+                this.senderStarting = false;
+            }
         }
 
         future.whenComplete((result, ex) -> {
@@ -602,7 +608,8 @@ public final class FileTransferClientService implements Closeable {
     }
 
     private boolean isTransferActiveLocked() {
-        return (activeSender != null && activeSender.isActive())
+        return senderStarting
+                || (activeSender != null && activeSender.isActive())
                 || (activeReceiver != null && activeReceiver.isActive());
     }
 

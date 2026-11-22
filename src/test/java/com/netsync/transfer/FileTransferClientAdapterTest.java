@@ -792,42 +792,64 @@ class FileTransferClientAdapterTest {
                     CountDownLatch readyLatch = new CountDownLatch(2);
                     CountDownLatch startLatch = new CountDownLatch(1);
 
-                    Future<?> offerFuture = executor.submit(() -> {
+                    Future<Boolean> offerFuture = executor.submit(() -> {
                         readyLatch.countDown();
-                        try {
-                            startLatch.await();
-                            MessageEnvelope offer = new MessageEnvelope(
-                                    ProtocolLimits.VERSION,
-                                    MessageType.FILE_OFFERED,
-                                    UUID.randomUUID(),
-                                    null,
-                                    new MessageBody.FileOffered(UUID.randomUUID(), UUID.randomUUID(), "inbound.txt", 1024)
-                            );
-                            adapter.transferService().handleControl(offer);
-                        } catch (Exception ignored) {
-                        }
+                        startLatch.await();
+                        MessageEnvelope offer = new MessageEnvelope(
+                                ProtocolLimits.VERSION,
+                                MessageType.FILE_OFFERED,
+                                UUID.randomUUID(),
+                                null,
+                                new MessageBody.FileOffered(UUID.randomUUID(), UUID.randomUUID(), "inbound.txt", 1024)
+                        );
+                        adapter.transferService().handleControl(offer);
+                        return adapter.transferService().receiverState()
+                                .filter(state -> state == FileReceiver.ReceiverState.OFFERED)
+                                .isPresent();
                     });
 
-                    Future<?> sendFuture = executor.submit(() -> {
+                    Future<Boolean> sendFuture = executor.submit(() -> {
                         readyLatch.countDown();
+                        startLatch.await();
                         try {
-                            startLatch.await();
                             registry.execute("/sendfile " + peerRecipient + " \"" + file.toString().replace('\\', '/') + "\"");
-                        } catch (Exception ignored) {
+                            return true;
+                        } catch (CommandRegistry.InputException e) {
+                            assertTrue(e.getMessage().contains("already active"));
+                            return false;
                         }
                     });
 
-                    readyLatch.await(5, TimeUnit.SECONDS);
+                    assertTrue(readyLatch.await(5, TimeUnit.SECONDS), "Both race tasks must be ready");
                     startLatch.countDown();
 
-                    offerFuture.get(5, TimeUnit.SECONDS);
-                    sendFuture.get(5, TimeUnit.SECONDS);
+                    boolean inboundOfferAccepted = offerFuture.get(5, TimeUnit.SECONDS);
+                    boolean outboundSendStarted = sendFuture.get(5, TimeUnit.SECONDS);
                     executor.shutdown();
 
-                    // In both outcomes, exactly one transfer can be active, or none if race collision occurred
-                    assertTrue(adapter.transferService().isTransferActive() || !outputLines.isEmpty());
-                    // Active transfer must be at most 1
-                    assertTrue(adapter.transferService().activeTransferId().isPresent());
+                    assertNotEquals(outboundSendStarted, inboundOfferAccepted,
+                            "Exactly one of the simultaneous transfers must be accepted");
+                    assertTrue(adapter.transferService().isTransferActive());
+
+                    boolean senderIsOffering = adapter.transferService().senderState()
+                            .filter(state -> state == FileSender.SenderState.OFFERING)
+                            .isPresent();
+                    boolean receiverHasOffer = adapter.transferService().receiverState()
+                            .filter(state -> state == FileReceiver.ReceiverState.OFFERED)
+                            .isPresent();
+                    assertNotEquals(senderIsOffering, receiverHasOffer,
+                            "The client must not hold an outbound and inbound transfer simultaneously");
+                    assertEquals(outboundSendStarted, senderIsOffering);
+                    assertEquals(inboundOfferAccepted, receiverHasOffer);
+
+                    if (outboundSendStarted) {
+                        assertTrue(outputLines.stream().anyMatch(line -> line.contains("Offering file race.txt")));
+                        assertTrue(outputLines.stream().anyMatch(line ->
+                                line.contains("Rejected") && line.contains("busy")));
+                    } else {
+                        assertTrue(outputLines.stream().anyMatch(line -> line.contains("Incoming file offer")
+                                && line.contains("inbound.txt")));
+                    }
                 }
             }
         }
