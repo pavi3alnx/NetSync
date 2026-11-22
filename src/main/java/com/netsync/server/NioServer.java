@@ -199,9 +199,13 @@ public final class NioServer implements AutoCloseable, OutboundSink, ConnectionC
      * SessionView has no creation timestamp: a session visible at this check wins
      * the boundary race. Disconnect hooks cancel pending security work; a late
      * callback cannot reopen a removed transport or enqueue output to it.
+     * A draining connection is already terminating, not awaiting login: logout
+     * revokes its session before its ACK drains. The progress timeout still
+     * bounds this state, without discarding the queued logout/failure response.
      */
     private boolean loginExpired(ConnectionState state, long now) {
-        return now - state.acceptedAt >= TimeUnit.SECONDS.toNanos(ProtocolLimits.LOGIN_TIMEOUT_SECONDS)
+        return !state.closing
+                && now - state.acceptedAt >= TimeUnit.SECONDS.toNanos(ProtocolLimits.LOGIN_TIMEOUT_SECONDS)
                 && state.session().isEmpty();
     }
 
