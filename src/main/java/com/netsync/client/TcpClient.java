@@ -8,6 +8,7 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.BiConsumer;
 
 /** Blocking socket I/O with one reader, one writer and one bounded serial dispatcher.
  * No application callbacks execute on socket threads. Disconnect cancels queued work;
@@ -26,6 +27,8 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
     private Link current;
     private SessionView session;
     private long protocolRejections;
+    private volatile Thread dispatchThread;
+    private final Set<BiConsumer<UUID, Failure>> disconnectListeners = new LinkedHashSet<>();
 
     public TcpClient() { this(256, 1_048_576, 256); }
     public TcpClient(int outputFrames, int outputBytes, int dispatchCapacity) {
@@ -33,7 +36,8 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         maxFrames = outputFrames; maxBytes = outputBytes;
         dispatch = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<>(dispatchCapacity), task -> {
-                Thread t = new Thread(task, "netsync-client-dispatch"); t.setDaemon(true); return t;
+                Thread t = new Thread(task, "netsync-client-dispatch");
+                dispatchThread = t; t.setDaemon(true); return t;
             }, new ThreadPoolExecutor.AbortPolicy());
     }
     public ClientDispatcher dispatcher() { return dispatcher; }
@@ -51,6 +55,17 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         session = value;
     }
     public synchronized void clearSession() { session = null; }
+    boolean isDispatchThread() { return Thread.currentThread() == dispatchThread; }
+    /** Client-internal lifecycle hook. Runs under the transport monitor: clear state only, never block. */
+    synchronized ClientDispatcher.Registration onDisconnect(BiConsumer<UUID, Failure> listener) {
+        Objects.requireNonNull(listener);
+        disconnectListeners.add(listener);
+        return () -> { synchronized (TcpClient.this) { disconnectListeners.remove(listener); } };
+    }
+    /** Authentication is restricted to the documented unencrypted loopback demo. */
+    public synchronized boolean isLoopbackConnection() {
+        return isConnected() && current.socket.getInetAddress().isLoopbackAddress();
+    }
     public void connect() throws IOException { connect(ProtocolLimits.BIND_ADDRESS, ProtocolLimits.TCP_PORT); }
     public void connect(String host, int port) throws IOException {
         Objects.requireNonNull(host);
@@ -169,12 +184,33 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         // Complete inbound frames preceding orderly EOF remain observable. Explicit
         // disconnect/reconnect, protocol failures and overload cancel pending callbacks.
         if (reason != Failure.REMOTE_CLOSED) { link.cancelled = true; dispatch.getQueue().clear(); }
+        if (!link.disconnectNotified) {
+            link.disconnectNotified = true;
+            for (var listener : List.copyOf(disconnectListeners)) {
+                try { listener.accept(link.id, reason); }
+                catch (RuntimeException failure) {
+                    System.getLogger(TcpClient.class.getName()).log(System.Logger.Level.WARNING,
+                            "Client disconnect listener failed (" + failure.getClass().getName() + ")");
+                }
+            }
+        }
         notifyAll();
     }
     public void disconnect() {
         Link link;
         synchronized (this) { link = current; if (link != null) stop(link, Failure.NONE); }
         if (link != null) { join(link.reader); join(link.writer); }
+    }
+    /** Close only the expected generation; a delayed feature timeout cannot close a reconnect. */
+    public void disconnect(UUID expectedConnectionId) {
+        Objects.requireNonNull(expectedConnectionId);
+        Link link;
+        synchronized (this) {
+            link = current;
+            if (link == null || !link.id.equals(expectedConnectionId)) return;
+            stop(link, Failure.NONE);
+        }
+        join(link.reader); join(link.writer);
     }
     @Override public void close() {
         synchronized (this) { state = State.CLOSED; }
@@ -197,6 +233,7 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         final ArrayDeque<ByteBuffer> output = new ArrayDeque<>();
         int bytes;
         boolean cancelled;
+        boolean disconnectNotified;
         Thread reader, writer;
     }
 }
