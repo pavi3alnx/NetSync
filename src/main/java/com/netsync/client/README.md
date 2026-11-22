@@ -1,8 +1,8 @@
 # NetSync client integration
 
-The client core contains transport, dispatch, session access and an extensible CLI.
-It does not implement authentication, chat routing, UDP heartbeats or file transfer
-business logic. It reuses all shared wire models and codecs without changes.
+The client contains transport, dispatch, session access, an extensible CLI and a
+production authentication adapter. It reuses the existing wire models and codecs.
+Chat routing, UDP heartbeats and file transfer are not composed into this CLI.
 
 ## Start the CLI (PowerShell, from the repository root)
 
@@ -27,6 +27,83 @@ Default: `127.0.0.1:5050`. The server must be started separately. EOF and `/quit
 close the client. Input/output streams remain caller-owned. CLI input executes on
 the caller thread. Incoming messages display only type and ID, never body fields,
 passwords or tokens. Binary frames require an actual file-module receiver.
+
+## Production authentication (Phase 1)
+
+In a real PowerShell terminal at the repository root, start the existing demo server:
+
+```powershell
+mvn -B compile dependency:build-classpath "-Dmdep.outputFile=target/client-classpath.txt"
+$netsyncClasspath = "target/classes;" + (Get-Content -Raw target/client-classpath.txt).Trim()
+java -cp $netsyncClasspath com.netsync.app.NetSyncServerApplication --insecure-demo --users alice,bob --port 5050
+```
+
+The names are example disposable identities. Enter fresh disposable passwords at
+the server's hidden prompts, never real account passwords. This is an unencrypted,
+loopback-only demo, unsuitable for untrusted networks or deployment.
+
+In another PowerShell terminal at the repository root:
+
+```powershell
+$netsyncClasspath = "target/classes;" + (Get-Content -Raw target/client-classpath.txt).Trim()
+java -cp $netsyncClasspath com.netsync.client.NetSyncClient
+```
+
+Enter `/connect 127.0.0.1 5050`, then `/login alice`, and enter the matching password
+at the hidden prompt. Never put passwords on the command line. Wait for `Logged in
+as ...`. `/logout` asynchronously sends the logout request, processes its correlated
+ACK and closes that connection. Use `/connect` and `/login` again for a fresh session.
+All existing core commands remain available.
+
+The server's ten-second login deadline starts at TCP acceptance, so finish password
+entry promptly after connecting. The adapter also bounds one pending login/logout
+to ten seconds, including password entry for login. Neither extends the server
+deadline. Timeout closes the original connection because the outcome may be
+uncertain; there is no automatic retry. Local input cancellation/validation can be
+retried while the connection is alive and its original server deadline has not expired.
+
+The real terminal path uses the same `java.io.Console` for command lines and hidden
+passwords. IDE/redirected input without `System.console()` cannot securely log in
+and receives a safe error; there is no echoed-password fallback. An already waiting
+console prompt cannot be forcibly cancelled by socket closure: finish/cancel it;
+the returned buffer is wiped and an expired request is not sent. Password collection
+is refused on the client dispatch thread. Response handling never waits for replies.
+
+Password arrays are cleared on success and failure. The existing immutable
+`LoginRequest`/String and transient encoded bytes cannot be explicitly erased; the
+adapter does not retain them. Input is limited to 1-128 UTF-16 code units to match
+the current demo credential store. Passwords, tokens and raw server/provider error
+text are never printed by the adapter. Authentication checks the actual connected
+peer is loopback before collecting or sending a password.
+
+Every `NetSyncClient` owns one `ClientAuthenticationAdapter`, available through
+`cli.authentication()`. A future shell may construct the adapter directly with a
+transport, command registry, bounded output consumer and `PasswordInput`. The CLI
+constructor overload accepting `PasswordInput` supports trusted embedding/tests;
+return a fresh owned `char[]` from a secure input provider. Register one authentication
+owner per command registry. Close removes its commands/subscriptions, stops its
+single periodic timeout task and disconnects an authentication connection it owns.
+
+Replies are correlated to a UUID and local connection generation. Success supplies
+the server-returned identity to `TcpClient.supplySession`. Logout keeps identity
+until accepted ACK, loss of authentication, disconnect or timeout; a denied logout
+does not discard a live identity. Orderly EOF can precede dispatch of a final
+ERROR/ACK: only bounded request metadata is retained for that response; credentials
+are cleared immediately by the internal nonblocking transport lifecycle hook.
+
+`presenceCredentials()` returns an optional current snapshot containing the session,
+token, heartbeat interval and presence timeout. Its `toString()` redacts the token.
+Future asynchronous composition must recheck `isCurrent(snapshot)` before using a
+captured snapshot and never log `presenceToken()`. Disconnect/reconnect/close
+invalidates access; a copy already retained by a caller cannot be erased remotely.
+The generation-specific `TcpClient.disconnect(UUID)` prevents late timeouts or
+responses from closing a new connection. No heartbeat, transfer or other feature
+adapter is started in this phase.
+
+```powershell
+mvn -B "-Dtest=ClientAuthenticationAdapterTest,ClientAuthenticationIntegrationTest" test
+mvn -B clean verify
+```
 
 ## Transport and outbound API
 
@@ -126,8 +203,9 @@ after its own successful authentication. Both the supplied UUID and the snapshot
 connectionId must equal the current local connection UUID. This is a local
 client-generation ID, not the server's internal connection ID. Session access is
 synchronized and empty after disconnect/close. Old generations cannot repopulate it.
-No authentication decisions, password storage, tokens or credential verification
-are implemented here. Security retains ownership of presence credentials separately.
+The transport itself makes no authentication decisions and stores no password or
+presence token. `ClientAuthenticationAdapter` validates/correlates authentication
+responses and owns the in-memory presence credentials separately from `SessionView`.
 
 ## CLI extension API
 
@@ -157,8 +235,8 @@ escaped backslashes (or forward slashes).
 var chatRegistration = client.dispatcher().register(MessageType.CHAT_DELIVER, chatHandler);
 ClientOutbound outbound = client;
 
-// Shalini: register authentication response handler; supplySession after validation.
-var loginRegistration = client.dispatcher().register(MessageType.LOGIN_RESPONSE, loginHandler);
+// Authentication is already owned by the CLI adapter; do not register a second owner.
+var authentication = cli.authentication();
 
 // Gayangi: register presence handlers and inspect isConnected/session/connectionId.
 var presenceRegistration = client.dispatcher().register(MessageType.PRESENCE_UPDATE, presenceHandler);
@@ -172,8 +250,8 @@ var fileRegistration = client.dispatcher().register(MessageType.FILE_OFFERED, re
 ```
 
 Register handlers before connecting/sending. Retain and close registration handles
-when a module shuts down. Core does not automatically instantiate module services or
-register future `/login`, `/logout`, `/users`, `/msg`, `/sendfile`, `/accept`, `/reject`
+when a module shuts down. Core does not automatically instantiate other module services or
+register future `/users`, `/msg`, `/sendfile`, `/accept`, `/reject`
 commands. TLS and UDP are outside this core; the CLI warns about unencrypted demo
 transport. Use disposable local credentials only until security supplies a protected
 transport. The CLI's metadata display is intentionally minimal; modules may render

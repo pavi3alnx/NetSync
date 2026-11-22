@@ -11,8 +11,13 @@ public final class NetSyncClient implements AutoCloseable {
     private final CommandRegistry commands = new CommandRegistry();
     private final PrintWriter output;
     private final List<ClientDispatcher.Registration> display = new ArrayList<>();
+    private final ClientAuthenticationAdapter authentication;
     private volatile boolean quit;
     public NetSyncClient(TcpClient transport, PrintWriter output) {
+        this(transport, output, ClientAuthenticationAdapter.PasswordInput.console());
+    }
+    public NetSyncClient(TcpClient transport, PrintWriter output,
+                         ClientAuthenticationAdapter.PasswordInput passwords) {
         this.transport = Objects.requireNonNull(transport); this.output = Objects.requireNonNull(output);
         commands.register("/help", "/help", "List commands", args -> {
             noArguments(args);
@@ -43,9 +48,11 @@ public final class NetSyncClient implements AutoCloseable {
                 message -> print("Received " + message.type() + " [" + message.messageId() + "]")));
         }
         // Binary is deliberately not consumed by the shell: file module must register a receiver.
+        authentication = new ClientAuthenticationAdapter(transport, commands, this::print, passwords);
     }
     public TcpClient transport() { return transport; }
     public CommandRegistry commands() { return commands; }
+    public ClientAuthenticationAdapter authentication() { return authentication; }
     public void execute(String line) {
         if (quit) return;
         try { commands.execute(line); }
@@ -58,24 +65,38 @@ public final class NetSyncClient implements AutoCloseable {
     }
     public void run(Reader input) throws IOException {
         Objects.requireNonNull(input);
-        print("Welcome to NetSync. Use /help to list commands.");
-        print("Unencrypted demo transport: use only disposable local credentials.");
+        welcome();
         BufferedReader reader = input instanceof BufferedReader b ? b : new BufferedReader(input);
         try {
             String line;
             while (!quit && (line = reader.readLine()) != null) execute(line);
         } finally { close(); }
     }
+    /** Uses the same Console for commands and hidden passwords; no competing buffered System.in reader. */
+    public void run(Console console) {
+        Objects.requireNonNull(console);
+        welcome();
+        try {
+            String line;
+            while (!quit && (line = console.readLine("netsync> ")) != null) execute(line);
+        } finally { close(); }
+    }
+    private void welcome() {
+        print("Welcome to NetSync. Use /help to list commands.");
+        print("Unencrypted loopback demo: use only disposable local credentials. Log in within 10 seconds of connecting.");
+    }
     private static void noArguments(List<String> args) {
         if (!args.isEmpty()) throw new CommandRegistry.InputException("This command takes no arguments");
     }
     private void print(String text) { synchronized (output) { output.println(text); output.flush(); } }
     @Override public void close() {
-        quit = true; display.forEach(ClientDispatcher.Registration::close); transport.close();
+        quit = true; authentication.close(); display.forEach(ClientDispatcher.Registration::close); transport.close();
     }
     public static void main(String[] args) throws IOException {
         try (NetSyncClient cli = new NetSyncClient(new TcpClient(), new PrintWriter(System.out, true))) {
-            cli.run(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+            Console console = System.console();
+            if (console != null) cli.run(console);
+            else cli.run(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         }
     }
 }

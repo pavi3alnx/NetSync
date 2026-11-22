@@ -21,6 +21,11 @@ public final class CommandRegistry {
     public synchronized List<Description> descriptions() {
         return commands.values().stream().map(Entry::description).toList();
     }
+    /** Remove only a command owned by this adapter, including constructor rollback. */
+    synchronized void unregister(String name, Command owner) {
+        Entry entry = commands.get(name);
+        if (entry != null && entry.command == owner) commands.remove(name);
+    }
     public void execute(String line) throws Exception {
         List<String> tokens = parse(line);
         if (tokens.isEmpty()) return;
