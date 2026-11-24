@@ -3,6 +3,7 @@ package com.netsync.client;
 import com.netsync.common.*;
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /** Thread-safe registration. Callbacks run serially on the client's dispatch thread.
  * Close prevents future invocations; an invocation already in progress may finish.
@@ -31,6 +32,9 @@ public final class ClientDispatcher implements AutoCloseable {
     }
     /** False means a binary chunk had no receiver; transport must close rather than lose data. */
     boolean dispatch(OutboundFrame frame) {
+        return dispatch(frame, () -> true);
+    }
+    boolean dispatch(OutboundFrame frame, BooleanSupplier generationCurrent) {
         if (frame instanceof MessageEnvelope message) {
             List<Slot<MessageEnvelope>> slots;
             synchronized (this) {
@@ -38,18 +42,18 @@ public final class ClientDispatcher implements AutoCloseable {
                 slots = List.copyOf(json.getOrDefault(message.type(), List.of()));
                 if (slots.isEmpty()) unhandled++;
             }
-            invoke(slots, message);
+            invoke(slots, message, generationCurrent);
             return true;
         }
         List<Slot<FileChunk>> slots;
         synchronized (this) { if (closed) return false; slots = List.copyOf(binary); }
         if (slots.isEmpty()) return false;
-        return invoke(slots, (FileChunk) frame) > 0;
+        return invoke(slots, (FileChunk) frame, generationCurrent) > 0 || !generationCurrent.getAsBoolean();
     }
-    private <T> int invoke(List<Slot<T>> slots, T value) {
+    private <T> int invoke(List<Slot<T>> slots, T value, BooleanSupplier generationCurrent) {
         int invoked = 0;
         for (Slot<T> slot : slots) {
-            if (!slot.active) continue;
+            if (!slot.active || !generationCurrent.getAsBoolean()) continue;
             invoked++;
             try { slot.handler.accept(value); }
             catch (RuntimeException e) { synchronized (this) { failures++; } }

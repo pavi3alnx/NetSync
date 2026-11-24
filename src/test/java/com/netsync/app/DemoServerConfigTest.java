@@ -18,9 +18,11 @@ class DemoServerConfigTest {
     @Test void validOptionsUseDocumentedDefaultPortAndImmutableUsers() {
         var config = DemoServerConfig.parse(new String[]{"--insecure-demo", "--users", "alice,bob"});
         assertEquals(5050, config.port());
+        assertEquals(5051, config.udpPort());
         assertEquals(List.of("alice", "bob"), config.users());
         assertThrows(UnsupportedOperationException.class, () -> config.users().add("charlie"));
         assertEquals(0, DemoServerConfig.parse(new String[]{"--users", "alice", "--port", "0", "--insecure-demo"}).port());
+        assertEquals(5052, DemoServerConfig.parse(new String[]{"--users", "alice", "--udp-port", "5052", "--insecure-demo"}).udpPort());
     }
 
     @Test void invalidOptionsPortsAndUsernamesAreRejectedWithoutEchoingArguments() {
@@ -29,6 +31,7 @@ class DemoServerConfigTest {
                 new String[]{"--insecure-demo", "--insecure-demo", "--users", "alice"},
                 new String[]{"--insecure-demo", "--users", "alice", "--port", "65536"},
                 new String[]{"--insecure-demo", "--users", "alice", "--port", "secret-value"},
+                new String[]{"--insecure-demo", "--users", "alice", "--udp-port", "65536"},
                 new String[]{"--insecure-demo", "--users", "alice,alice"},
                 new String[]{"--insecure-demo", "--users", "alice,"},
                 new String[]{"--insecure-demo", "--users", "invalid-user"},

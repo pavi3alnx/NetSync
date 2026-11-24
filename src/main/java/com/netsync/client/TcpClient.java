@@ -46,6 +46,10 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
     public synchronized Failure failure() { return failure; }
     @Override public synchronized boolean isConnected() { return state == State.CONNECTED; }
     public synchronized Optional<UUID> connectionId() { return isConnected() ? Optional.of(current.id) : Optional.empty(); }
+    synchronized boolean isGenerationCurrent(UUID id) { return current != null && current.id.equals(id); }
+    synchronized boolean isGenerationActive(UUID id) {
+        return current != null && current.id.equals(id) && state == State.CONNECTED;
+    }
     public synchronized Optional<SessionView> session() { return isConnected() ? Optional.ofNullable(session) : Optional.empty(); }
     /** Security supplies a shared immutable snapshot bound to this local connection generation. */
     public synchronized void supplySession(UUID connectionId, SessionView value) {
@@ -145,7 +149,7 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
                 }
                 try {
                     dispatch.execute(() -> {
-                        if (dispatchable(link) && !dispatcher.dispatch(frame)) stop(link, Failure.NO_BINARY_HANDLER);
+                        if (dispatchable(link) && !dispatcher.dispatch(frame, () -> dispatchable(link))) stop(link, Failure.NO_BINARY_HANDLER);
                     });
                 } catch (RejectedExecutionException e) { stop(link, Failure.DISPATCH_FULL); return; }
             }

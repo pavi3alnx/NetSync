@@ -17,6 +17,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /** Sends loopback UDP heartbeats for an authenticated session supplied by the caller. */
 public final class HeartbeatSender implements AutoCloseable {
@@ -34,10 +35,15 @@ public final class HeartbeatSender implements AutoCloseable {
     private DatagramChannel channel;
     private ScheduledExecutorService scheduler;
     private boolean running;
+    private final BooleanSupplier credentialsCurrent;
 
     public HeartbeatSender(InetSocketAddress serverAddress, UUID clientId, String presenceToken) {
         this(serverAddress, clientId, presenceToken,
-                Duration.ofSeconds(ProtocolLimits.HEARTBEAT_INTERVAL_SECONDS));
+                Duration.ofSeconds(ProtocolLimits.HEARTBEAT_INTERVAL_SECONDS), () -> true);
+    }
+
+    public HeartbeatSender(InetSocketAddress address, UUID clientId, String token, BooleanSupplier credentialsCurrent) {
+        this(address, clientId, token, Duration.ofSeconds(ProtocolLimits.HEARTBEAT_INTERVAL_SECONDS), credentialsCurrent);
     }
 
     HeartbeatSender(
@@ -45,10 +51,16 @@ public final class HeartbeatSender implements AutoCloseable {
             UUID clientId,
             String presenceToken,
             Duration interval) {
+        this(serverAddress, clientId, presenceToken, interval, () -> true);
+    }
+
+    private HeartbeatSender(InetSocketAddress serverAddress, UUID clientId, String presenceToken,
+                            Duration interval, BooleanSupplier credentialsCurrent) {
         this.serverAddress = requireLoopback(serverAddress);
         this.clientId = Objects.requireNonNull(clientId);
         this.presenceToken = Objects.requireNonNull(presenceToken);
         this.intervalNanos = Objects.requireNonNull(interval).toNanos();
+        this.credentialsCurrent = Objects.requireNonNull(credentialsCurrent);
         if (intervalNanos <= 0) {
             throw new IllegalArgumentException("Heartbeat interval must be positive");
         }
@@ -68,6 +80,7 @@ public final class HeartbeatSender implements AutoCloseable {
             DatagramChannel openedChannel = DatagramChannel.open();
             ScheduledExecutorService openedScheduler = null;
             try {
+                openedChannel.configureBlocking(false);
                 openedScheduler = Executors.newSingleThreadScheduledExecutor(task -> {
                     Thread thread = new Thread(task, "netsync-heartbeat-sender");
                     thread.setDaemon(true);
@@ -82,7 +95,7 @@ public final class HeartbeatSender implements AutoCloseable {
                         0,
                         intervalNanos,
                         TimeUnit.NANOSECONDS);
-            } catch (RuntimeException failure) {
+            } catch (IOException | RuntimeException failure) {
                 running = false;
                 channel = null;
                 scheduler = null;
@@ -136,6 +149,7 @@ public final class HeartbeatSender implements AutoCloseable {
     }
 
     private void sendNextHeartbeat() {
+        if (!credentialsCurrent.getAsBoolean()) { stop(); return; }
         DatagramChannel currentChannel;
         synchronized (lifecycleLock) {
             if (!running || channel == null) {

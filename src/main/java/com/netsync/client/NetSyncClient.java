@@ -9,31 +9,49 @@ import java.util.*;
 public final class NetSyncClient implements AutoCloseable {
     private final TcpClient transport;
     private final CommandRegistry commands = new CommandRegistry();
-    private final PrintWriter output;
+    private final ClientOutputQueue output;
     private final List<ClientDispatcher.Registration> display = new ArrayList<>();
     private final ClientAuthenticationAdapter authentication;
+    private final ClientPresenceAdapter presence;
+    private final int defaultUdpPort;
     private volatile boolean quit;
     public NetSyncClient(TcpClient transport, PrintWriter output) {
         this(transport, output, ClientAuthenticationAdapter.PasswordInput.console());
     }
     public NetSyncClient(TcpClient transport, PrintWriter output,
                          ClientAuthenticationAdapter.PasswordInput passwords) {
-        this.transport = Objects.requireNonNull(transport); this.output = Objects.requireNonNull(output);
+        this(transport, output, passwords, ProtocolLimits.UDP_PORT);
+    }
+    public NetSyncClient(TcpClient transport, PrintWriter output,
+                         ClientAuthenticationAdapter.PasswordInput passwords, int udpPort) {
+        this.transport = Objects.requireNonNull(transport);
+        PrintWriter writer = Objects.requireNonNull(output);
+        if (udpPort < 1 || udpPort > 65535) throw new IllegalArgumentException("Invalid presence UDP port");
+        this.output = new ClientOutputQueue(text -> {
+            synchronized (writer) { writer.println(text); writer.flush(); }
+        }, transport::isGenerationCurrent, transport::isGenerationActive, ClientOutputQueue.DEFAULT_CAPACITY);
+        this.defaultUdpPort = udpPort;
         commands.register("/help", "/help", "List commands", args -> {
             noArguments(args);
             commands.descriptions().forEach(d -> print(d.usage() + " - " + d.summary()));
         });
-        commands.register("/quit", "/quit", "Exit", args -> { noArguments(args); quit = true; transport.close(); });
-        commands.register("/connect", "/connect [host [port]]", "Connect (default 127.0.0.1:5050)", args -> {
-            if (args.size() > 2) throw new CommandRegistry.InputException("Usage: /connect [host [port]]");
+        commands.register("/quit", "/quit", "Exit", args -> { noArguments(args); close(); });
+        commands.register("/connect", "/connect [host [tcp-port [udp-port]]]", "Connect (default 127.0.0.1 TCP 5050 UDP 5051)", args -> {
+            if (args.size() > 3) throw new CommandRegistry.InputException("Usage: /connect [host [tcp-port [udp-port]]]");
             int port = ProtocolLimits.TCP_PORT;
-            if (args.size() == 2) {
+            int presencePort = defaultUdpPort;
+            if (args.size() >= 2) {
                 try { port = Integer.parseInt(args.get(1)); }
                 catch (NumberFormatException e) { throw new CommandRegistry.InputException("Port must be an integer from 1 to 65535"); }
+            }
+            if (args.size() == 3) {
+                try { presencePort = Integer.parseInt(args.get(2)); }
+                catch (NumberFormatException e) { throw new CommandRegistry.InputException("UDP port must be from 1 to 65535"); }
             }
             if (port < 1 || port > 65535) throw new CommandRegistry.InputException("Port must be from 1 to 65535");
             if (transport.state() != TcpClient.State.DISCONNECTED)
                 throw new CommandRegistry.InputException("Disconnect before connecting again");
+            configurePresencePort(presencePort);
             transport.connect(args.isEmpty() ? ProtocolLimits.BIND_ADDRESS : args.getFirst(), port);
             print("Connected.");
         });
@@ -45,14 +63,18 @@ public final class NetSyncClient implements AutoCloseable {
         });
         for (MessageType type : MessageType.values()) {
             if (type != MessageType.FILE_CHUNK) display.add(transport.dispatcher().register(type,
-                message -> print("Received " + message.type() + " [" + message.messageId() + "]")));
+                message -> this.output.offerActiveImportant("Received " + message.type() + " [" + message.messageId() + "]",
+                        transport.connectionId().orElse(null))));
         }
         // Binary is deliberately not consumed by the shell: file module must register a receiver.
-        authentication = new ClientAuthenticationAdapter(transport, commands, this::print, passwords);
+        authentication = new ClientAuthenticationAdapter(transport, commands, this.output, passwords);
+        presence = new ClientPresenceAdapter(transport, authentication, commands, this.output, udpPort);
     }
     public TcpClient transport() { return transport; }
     public CommandRegistry commands() { return commands; }
     public ClientAuthenticationAdapter authentication() { return authentication; }
+    public ClientPresenceAdapter presence() { return presence; }
+    private void configurePresencePort(int port) { presence.setUdpPort(port); }
     public void execute(String line) {
         if (quit) return;
         try { commands.execute(line); }
@@ -88,9 +110,10 @@ public final class NetSyncClient implements AutoCloseable {
     private static void noArguments(List<String> args) {
         if (!args.isEmpty()) throw new CommandRegistry.InputException("This command takes no arguments");
     }
-    private void print(String text) { synchronized (output) { output.println(text); output.flush(); } }
+    private void print(String text) { output.offer(text); }
     @Override public void close() {
-        quit = true; authentication.close(); display.forEach(ClientDispatcher.Registration::close); transport.close();
+        quit = true; presence.close(); authentication.close(); display.forEach(ClientDispatcher.Registration::close);
+        transport.close(); output.close();
     }
     public static void main(String[] args) throws IOException {
         try (NetSyncClient cli = new NetSyncClient(new TcpClient(), new PrintWriter(System.out, true))) {

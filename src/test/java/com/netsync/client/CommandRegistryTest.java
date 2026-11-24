@@ -33,6 +33,8 @@ class CommandRegistryTest {
             cli.commands().register("/users", "/users", "Module users command", a -> {});
             cli.commands().register("/bad", "/bad", "Fail", a -> { throw new RuntimeException("secret-token"); });
             cli.execute("/help"); cli.execute("/status"); cli.execute("/missing"); cli.execute("/bad"); cli.execute("/msg 'bad");
+            await(() -> output.toString().contains("/users - Module users command")
+                    && output.toString().contains("DISCONNECTED") && output.toString().contains("Command"));
             String text = output.toString();
             assertTrue(text.contains("/users - Module users command")); assertTrue(text.contains("DISCONNECTED"));
             assertTrue(text.contains("Command")); assertFalse(text.contains("secret-token"));
@@ -53,11 +55,17 @@ class CommandRegistryTest {
                 }
             }
         }
-        assertTrue(output.toString().contains("CONNECTED")); assertTrue(output.toString().contains("Welcome to NetSync"));
+        await(() -> output.toString().contains("CONNECTED") && output.toString().contains("Welcome to NetSync"));
         TcpClient eofTransport = new TcpClient();
         try (NetSyncClient eof = new NetSyncClient(eofTransport, new PrintWriter(new StringWriter()))) {
             eof.run(new StringReader("")); assertEquals(TcpClient.State.CLOSED, eofTransport.state());
         }
+    }
+
+    private static void await(java.util.function.BooleanSupplier condition) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) Thread.yield();
+        assertTrue(condition.getAsBoolean());
     }
     @Test void eofAndInputFailureCloseConnectedTransport() throws Exception {
         for (boolean fail : List.of(false, true)) {

@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -111,9 +112,113 @@ class PresenceEventPublisherTest {
         publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
         selectorTasks.runAll();
         sessions.remove(ALICE_ID);
-        publisher.forgetSession(ALICE_ID);
         publisher.onPresenceChanged(ALICE_ID, PresenceState.OFFLINE);
+        publisher.forgetSession(ALICE_ID);
+        selectorTasks.runAll();
 
+        assertEquals(0, selectorTasks.size());
+    }
+
+    @Test
+    void logoutCancelsQueuedOnlineThatWasNeverPublished() {
+        TestSessionRegistry sessions = new TestSessionRegistry(ALICE, BOB);
+        TestSelectorTasks selectorTasks = new TestSelectorTasks();
+        CapturingSink outbound = new CapturingSink();
+        PresenceEventPublisher publisher = new PresenceEventPublisher(selectorTasks, sessions, outbound);
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        sessions.remove(ALICE_ID);
+        publisher.forgetSession(ALICE_ID);
+        selectorTasks.runAll();
+        assertTrue(outbound.sent.isEmpty());
+    }
+
+    @Test
+    void boundsRetainedEntriesAndRetriesAfterSelectorRejectsWork() {
+        TestSessionRegistry sessions = new TestSessionRegistry(ALICE, BOB);
+        TestSelectorTasks selectorTasks = new TestSelectorTasks();
+        PresenceEventPublisher publisher = new PresenceEventPublisher(selectorTasks, sessions, new CapturingSink(), 1);
+        assertTrue(publisher.registerSession(ALICE));
+        assertFalse(publisher.registerSession(BOB));
+        assertEquals(1, publisher.retainedSessions());
+        selectorTasks.reject = true;
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        assertEquals(0, selectorTasks.size());
+        selectorTasks.reject = false;
+        publisher.retryPending();
+        assertEquals(1, selectorTasks.size());
+        selectorTasks.runAll();
+    }
+
+    @Test
+    void newerOfflineStateSurvivesSelectorSubmissionRejection() {
+        TestSessionRegistry sessions = new TestSessionRegistry(ALICE, BOB);
+        TestSelectorTasks selectorTasks = new TestSelectorTasks();
+        CapturingSink outbound = new CapturingSink();
+        PresenceEventPublisher publisher = new PresenceEventPublisher(selectorTasks, sessions, outbound, 2);
+        publisher.registerSession(ALICE);
+        selectorTasks.reject = true;
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.OFFLINE);
+        selectorTasks.reject = false;
+        publisher.retryPending();
+        selectorTasks.runAll();
+        assertEquals(2, outbound.sent.size());
+        for (SentFrame sent : outbound.sent) {
+            MessageEnvelope event = assertInstanceOf(MessageEnvelope.class, sent.frame());
+            assertEquals(PresenceState.OFFLINE,
+                    assertInstanceOf(MessageBody.PresenceUpdate.class, event.body()).state());
+        }
+    }
+
+    @Test
+    void logoutOrDisconnectDuringQueuedOnlineCancelsStalePublicationAndCleansUp() {
+        TestSessionRegistry sessions = new TestSessionRegistry(ALICE, BOB);
+        TestSelectorTasks selectorTasks = new TestSelectorTasks();
+        CapturingSink outbound = new CapturingSink();
+        PresenceEventPublisher publisher = new PresenceEventPublisher(selectorTasks, sessions, outbound);
+        publisher.registerSession(ALICE);
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        sessions.remove(ALICE_ID);
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.OFFLINE);
+        publisher.forgetSession(ALICE_ID);
+        selectorTasks.runAll();
+        assertTrue(outbound.sent.isEmpty());
+        assertEquals(0, publisher.retainedSessions());
+    }
+
+    @Test
+    void repeatedPublishedStateDoesNotScheduleDuplicateNotificationsAndCleanupIsComplete() {
+        TestSessionRegistry sessions = new TestSessionRegistry(ALICE, BOB);
+        TestSelectorTasks selectorTasks = new TestSelectorTasks();
+        CapturingSink outbound = new CapturingSink();
+        PresenceEventPublisher publisher = new PresenceEventPublisher(selectorTasks, sessions, outbound);
+        publisher.registerSession(ALICE);
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        selectorTasks.runAll();
+        int delivered = outbound.sent.size();
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        assertEquals(0, selectorTasks.size());
+        sessions.remove(ALICE_ID);
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.OFFLINE);
+        publisher.forgetSession(ALICE_ID);
+        selectorTasks.runAll();
+        assertEquals(delivered + 1, outbound.sent.size());
+        assertEquals(0, publisher.retainedSessions());
+    }
+
+    @Test
+    void closeClearsRejectedPendingTransitionsAndPreventsLaterRetry() {
+        TestSessionRegistry sessions = new TestSessionRegistry(ALICE, BOB);
+        TestSelectorTasks selectorTasks = new TestSelectorTasks();
+        PresenceEventPublisher publisher = new PresenceEventPublisher(selectorTasks, sessions, new CapturingSink());
+        publisher.registerSession(ALICE);
+        selectorTasks.reject = true;
+        publisher.onPresenceChanged(ALICE_ID, PresenceState.ONLINE);
+        assertEquals(1, publisher.retainedSessions());
+        publisher.close();
+        selectorTasks.reject = false;
+        publisher.retryPending();
+        assertEquals(0, publisher.retainedSessions());
         assertEquals(0, selectorTasks.size());
     }
 
@@ -131,9 +236,11 @@ class PresenceEventPublisherTest {
 
     private static final class TestSelectorTasks implements SelectorTasks {
         private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
+        private volatile boolean reject;
 
         @Override
         public boolean submit(Runnable task) {
+            if (reject) return false;
             return tasks.add(task);
         }
 

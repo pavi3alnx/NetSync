@@ -4,10 +4,14 @@ import com.netsync.common.ProtocolLimits;
 import java.util.*;
 
 /** Explicit, loopback-only disposable authentication demo; never contains passwords. */
-public record DemoServerConfig(boolean insecureDemo, int port, List<String> users) {
+public record DemoServerConfig(boolean insecureDemo, int port, List<String> users, int udpPort) {
+    public DemoServerConfig(boolean insecureDemo, int port, List<String> users) {
+        this(insecureDemo, port, users, ProtocolLimits.UDP_PORT);
+    }
     public DemoServerConfig {
         if (!insecureDemo) throw new IllegalArgumentException("Explicit --insecure-demo enablement is required");
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Port must be from 0 to 65535");
+        if (udpPort < 0 || udpPort > 65535) throw new IllegalArgumentException("UDP port must be from 0 to 65535");
         if (users == null || users.isEmpty() || users.size() > ProtocolLimits.MAX_CONNECTIONS)
             throw new IllegalArgumentException("Provide between 1 and 100 disposable demo usernames");
         Set<String> unique = new HashSet<>();
@@ -22,11 +26,12 @@ public record DemoServerConfig(boolean insecureDemo, int port, List<String> user
         Objects.requireNonNull(args);
         boolean demo = false;
         int port = ProtocolLimits.TCP_PORT;
+        int udpPort = ProtocolLimits.UDP_PORT;
         List<String> users = List.of();
         Set<String> options = new HashSet<>();
         for (int i = 0; i < args.length; i++) {
             String option = args[i];
-            if (!Set.of("--insecure-demo", "--port", "--users").contains(option) || !options.add(option))
+            if (!Set.of("--insecure-demo", "--port", "--udp-port", "--users").contains(option) || !options.add(option))
                 throw new IllegalArgumentException("Unknown or repeated option");
             switch (option) {
                 case "--insecure-demo" -> demo = true;
@@ -39,9 +44,14 @@ public record DemoServerConfig(boolean insecureDemo, int port, List<String> user
                     if (++i == args.length) throw new IllegalArgumentException("Missing demo usernames");
                     users = Arrays.asList(args[i].split(",", -1));
                 }
+                case "--udp-port" -> {
+                    if (++i == args.length) throw new IllegalArgumentException("Missing UDP port");
+                    try { udpPort = Integer.parseInt(args[i]); }
+                    catch (NumberFormatException e) { throw new IllegalArgumentException("Invalid UDP port"); }
+                }
                 default -> throw new AssertionError();
             }
         }
-        return new DemoServerConfig(demo, port, users);
+        return new DemoServerConfig(demo, port, users, udpPort);
     }
 }
