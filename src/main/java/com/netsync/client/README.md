@@ -1,8 +1,8 @@
 # NetSync client integration
 
-The client contains transport, dispatch, session access, an extensible CLI and a
-production authentication adapter. It reuses the existing wire models and codecs.
-Chat routing, UDP heartbeats and file transfer are not composed into this CLI.
+The client contains transport, dispatch, session access, an extensible CLI and
+production authentication, presence and private-chat adapters. It reuses the
+existing wire models and codecs. File transfer is not composed into this CLI.
 
 ## Start the CLI (PowerShell, from the repository root)
 
@@ -19,14 +19,19 @@ Example commands:
 /connect
 /status
 /disconnect
-/connect 127.0.0.1 5050
+/connect 127.0.0.1 5050 5051
+/login alice
+/presence
+/chat <recipientClientId> Hello there
+/logout
 /quit
 ```
 
-Default: `127.0.0.1:5050`. The server must be started separately. EOF and `/quit`
+Default: `127.0.0.1:5050` TCP and UDP `5051`. The server must be started separately. EOF and `/quit`
 close the client. Input/output streams remain caller-owned. CLI input executes on
-the caller thread. Incoming messages display only type and ID, never body fields,
-passwords or tokens. Binary frames require an actual file-module receiver.
+the caller thread. Generic incoming messages display only type and ID; the chat
+adapter renders chat text and sender client IDs. Passwords and presence tokens are
+never rendered. Binary frames require an actual file-module receiver.
 
 ## Production authentication (Phase 1)
 
@@ -35,7 +40,7 @@ In a real PowerShell terminal at the repository root, start the existing demo se
 ```powershell
 mvn -B compile dependency:build-classpath "-Dmdep.outputFile=target/client-classpath.txt"
 $netsyncClasspath = "target/classes;" + (Get-Content -Raw target/client-classpath.txt).Trim()
-java -cp $netsyncClasspath com.netsync.app.NetSyncServerApplication --insecure-demo --users alice,bob --port 5050
+java -cp $netsyncClasspath com.netsync.app.NetSyncServerApplication --insecure-demo --users alice,bob --port 5050 --udp-port 5051
 ```
 
 The names are example disposable identities. Enter fresh disposable passwords at
@@ -97,8 +102,18 @@ Future asynchronous composition must recheck `isCurrent(snapshot)` before using 
 captured snapshot and never log `presenceToken()`. Disconnect/reconnect/close
 invalidates access; a copy already retained by a caller cannot be erased remotely.
 The generation-specific `TcpClient.disconnect(UUID)` prevents late timeouts or
-responses from closing a new connection. No heartbeat, transfer or other feature
-adapter is started in this phase.
+responses from closing a new connection.
+
+After login, the production CLI starts UDP heartbeats every five seconds. `/presence`
+returns client IDs for use with `/chat <recipientClientId> <message>`. Chat text may
+contain spaces and is limited to 4,096 UTF-8 bytes. A correlated `ACK/QUEUED` means
+the recipient's TCP output queue accepted the message; it is not a receipt or read
+confirmation. At most 128 chat requests remain pending, each for up to 30 seconds.
+A timeout reports an unknown outcome and never resends. Logout, disconnect,
+reconnect and close clear session-bound chat state. Chat shares the bounded output
+worker with authentication and presence; saturation uses its visible omission
+notice. Presence expiry is advisory and does not revoke a live TCP chat session.
+File-transfer integration, TLS and remote deployment are not provided.
 
 ```powershell
 mvn -B "-Dtest=ClientAuthenticationAdapterTest,ClientAuthenticationIntegrationTest" test
@@ -250,9 +265,7 @@ var fileRegistration = client.dispatcher().register(MessageType.FILE_OFFERED, re
 ```
 
 Register handlers before connecting/sending. Retain and close registration handles
-when a module shuts down. Core does not automatically instantiate other module services or
-register future `/users`, `/msg`, `/sendfile`, `/accept`, `/reject`
-commands. TLS and UDP are outside this core; the CLI warns about unencrypted demo
-transport. Use disposable local credentials only until security supplies a protected
-transport. The CLI's metadata display is intentionally minimal; modules may render
-safe business information through their own handlers.
+when a module shuts down. The production CLI registers `/login`, `/logout`,
+`/presence` and `/chat` once. It warns about unencrypted demo transport. Use
+disposable local credentials only; the chat adapter renders safe message text and
+sender IDs.

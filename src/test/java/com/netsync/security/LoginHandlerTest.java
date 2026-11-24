@@ -13,6 +13,7 @@ import java.util.concurrent.RejectedExecutionException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LoginHandlerTest {
@@ -44,7 +45,10 @@ class LoginHandlerTest {
     void invalidCredentialsReturnGenericAuthenticationFailure() {
         Fixture fixture = new Fixture();
         UUID connectionId = UUID.randomUUID();
-        UUID requestId = UUID.randomUUID();
+        // Deliberately contains the submitted password substring. The envelope's
+        // generated record string includes replyTo, so scanning that whole string
+        // would produce a false positive unrelated to the error payload.
+        UUID requestId = UUID.fromString("00000000-0000-0000-0000-00000000bad0");
 
         fixture.handler.handle(fixture.context(connectionId), login(requestId, "unknown", "bad"));
         fixture.worker.runNext();
@@ -56,8 +60,13 @@ class LoginHandlerTest {
         MessageBody.Error error = (MessageBody.Error) response.body();
         assertEquals(ErrorCode.AUTH_FAILED, error.code());
         assertEquals("Authentication failed", error.message());
+        assertNull(error.transferId());
+        assertFalse(error.message().contains("bad"));
+        assertTrue(response.toString().contains("bad"), "The deterministic correlation UUID reproduces the old false positive");
         assertFalse(fixture.auth.isAuthenticatedConnection(connectionId));
-        assertFalse(response.toString().contains("bad"));
+        assertTrue(fixture.auth.sessionForConnection(connectionId).isEmpty());
+        assertTrue(fixture.registry.activeSessions().isEmpty());
+        assertFalse(fixture.auth.isPresenceTokenValid(UUID.fromString("00000000-0000-0000-0000-00000000bad0"), "bad"));
     }
 
     @Test

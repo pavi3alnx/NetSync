@@ -1,5 +1,6 @@
 package com.netsync.client;
 
+import com.netsync.chat.ChatClientAdapter;
 import com.netsync.common.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -13,6 +14,7 @@ public final class NetSyncClient implements AutoCloseable {
     private final List<ClientDispatcher.Registration> display = new ArrayList<>();
     private final ClientAuthenticationAdapter authentication;
     private final ClientPresenceAdapter presence;
+    private final ChatClientAdapter chat;
     private final int defaultUdpPort;
     private volatile boolean quit;
     public NetSyncClient(TcpClient transport, PrintWriter output) {
@@ -62,18 +64,28 @@ public final class NetSyncClient implements AutoCloseable {
             noArguments(args); print(transport.state() + " (" + transport.failure() + ")");
         });
         for (MessageType type : MessageType.values()) {
-            if (type != MessageType.FILE_CHUNK) display.add(transport.dispatcher().register(type,
-                message -> this.output.offerActiveImportant("Received " + message.type() + " [" + message.messageId() + "]",
-                        transport.connectionId().orElse(null))));
+            if (type != MessageType.FILE_CHUNK) display.add(transport.dispatcher().register(type, this::displayGenericMessage));
         }
         // Binary is deliberately not consumed by the shell: file module must register a receiver.
         authentication = new ClientAuthenticationAdapter(transport, commands, this.output, passwords);
         presence = new ClientPresenceAdapter(transport, authentication, commands, this.output, udpPort);
+        chat = new ChatClientAdapter(transport, authentication, commands,
+                (text, generation, activeOnly) -> {
+                    if (activeOnly) this.output.offerActiveImportant(text, generation);
+                    else this.output.offerImportant(text, generation);
+                });
     }
     public TcpClient transport() { return transport; }
     public CommandRegistry commands() { return commands; }
     public ClientAuthenticationAdapter authentication() { return authentication; }
     public ClientPresenceAdapter presence() { return presence; }
+    public ChatClientAdapter chat() { return chat; }
+    ClientOutputQueue outputQueueForTesting() { return output; }
+    private void displayGenericMessage(MessageEnvelope message) {
+        if (chat != null && chat.ownsResponse(message)) return;
+        output.offerActiveImportant("Received " + message.type() + " [" + message.messageId() + "]",
+                transport.connectionId().orElse(null));
+    }
     private void configurePresencePort(int port) { presence.setUdpPort(port); }
     public void execute(String line) {
         if (quit) return;
@@ -112,7 +124,7 @@ public final class NetSyncClient implements AutoCloseable {
     }
     private void print(String text) { output.offer(text); }
     @Override public void close() {
-        quit = true; presence.close(); authentication.close(); display.forEach(ClientDispatcher.Registration::close);
+        quit = true; chat.close(); presence.close(); authentication.close(); display.forEach(ClientDispatcher.Registration::close);
         transport.close(); output.close();
     }
     public static void main(String[] args) throws IOException {

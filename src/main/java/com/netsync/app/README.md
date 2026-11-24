@@ -1,8 +1,8 @@
-# Phase 5A authentication server
+# Production loopback demo application
 
-`com.netsync.app.NetSyncServerApplication` is the application entry point for the
-existing authentication services. The older `server.NioServer` main remains a
-transport-only entry point; use the application main below for login/logout.
+`com.netsync.app.NetSyncServerApplication` composes authentication, UDP presence
+and private TCP chat over the existing NIO server. The older `server.NioServer`
+main remains a transport-only entry point; use the application main below.
 
 ## Start from PowerShell
 
@@ -11,7 +11,7 @@ Run in a real interactive terminal, from the repository root, using Java 21:
 ```powershell
 mvn -B compile dependency:build-classpath "-Dmdep.outputFile=target/server-classpath.txt"
 $serverClasspath = "target/classes;" + (Get-Content -Raw target/server-classpath.txt).Trim()
-java -cp $serverClasspath com.netsync.app.NetSyncServerApplication --insecure-demo --users alice,bob --port 5050
+java -cp $serverClasspath com.netsync.app.NetSyncServerApplication --insecure-demo --users alice,bob --port 5050 --udp-port 5051
 ```
 
 The names above are examples of disposable local identities. Choose your own
@@ -36,7 +36,7 @@ untrusted networks/deployment. TCP is unencrypted; there is no TLS.
 
 ## Current behavior
 
-- Real `LOGIN_REQUEST` / `LOGIN_RESPONSE` and `LOGOUT_REQUEST` / `ACK` handlers.
+- Real `LOGIN_REQUEST` / `LOGIN_RESPONSE`, `LOGOUT_REQUEST` / `ACK`, presence and `CHAT_SEND` handlers.
 - One security-owned session registry shared by authentication, authorization and
   the transport's live connection lookup.
 - Two bounded credential workers with 32 queued tasks, reusing
@@ -46,15 +46,19 @@ untrusted networks/deployment. TCP is unencrypted; there is no TLS.
 - Logout returns `ACK/ACCEPTED`, revokes the session, then closes after draining.
 - Existing 10-second login deadline and 1,024-entry JSON duplicate-ID guard remain
   active. A duplicate returns `DUPLICATE_MESSAGE` before handler dispatch.
-- Other decoded operations require authentication and are then rejected as
-  unsupported. Binary frames receive a bounded error response; no no-op receiver
-  or placeholder feature handler is installed.
+- Authenticated chat derives sender identity from the authoritative TCP session,
+  routes by recipient client ID through the shared session registry, and uses the
+  same nonblocking outbound sink. A queued ACK confirms only recipient output-queue
+  acceptance, not receipt or reading. UDP presence expiry does not revoke TCP chat
+  authorization. Binary frames still receive a bounded error response; there is no
+  file-transfer service or placeholder receiver.
 
-The standalone client CLI still has **no login/logout commands**. This phase is
-verified by loopback TCP integration tests using the real wire codec. No chat,
-UDP presence, heartbeat sender, file transfer or client changes are included.
-Login responses retain the existing presence-token/interval fields, but no UDP
-service is running in this phase. Do not present this as the complete NetSync demo.
+`NetSyncClient` supplies production `/login`, `/logout`, `/presence` and
+`/chat <recipientClientId> <message>` commands. The UDP port defaults to 5051 and
+can be selected with `--udp-port`; both listeners bind only to loopback. Clients
+send heartbeats every five seconds and presence expires after fifteen seconds.
+See `docs/chat-demo.md` for the production demonstration. This is not a TLS,
+remote deployment or file-transfer demonstration.
 
 ## Stop and lifecycle
 

@@ -3,6 +3,7 @@ package com.netsync.app;
 import com.netsync.common.*;
 import com.netsync.security.*;
 import com.netsync.presence.*;
+import com.netsync.chat.ChatHandler;
 import com.netsync.server.MessageDispatcher;
 import com.netsync.server.NioServer;
 import com.netsync.transfer.TransferWorkerPool;
@@ -94,6 +95,7 @@ public final class NetSyncServerApplication implements AutoCloseable {
                         .register(MessageType.LOGIN_REQUEST, login)
                         .register(MessageType.LOGOUT_REQUEST, logout)
                         .register(MessageType.PRESENCE_QUERY, new PresenceHandler(authorization, sessions, presence, nio))
+                        .register(MessageType.CHAT_SEND, new ChatHandler(sessions, authorization, nio))
                         .build(nio);
                 return (context, message) -> {
                     if (message.type() != MessageType.LOGIN_REQUEST
