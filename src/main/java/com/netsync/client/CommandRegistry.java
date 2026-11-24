@@ -22,7 +22,7 @@ public final class CommandRegistry {
         return commands.values().stream().map(Entry::description).toList();
     }
     /** Remove only a command owned by this adapter, including constructor rollback. */
-    synchronized void unregister(String name, Command owner) {
+    public synchronized void unregister(String name, Command owner) {
         Entry entry = commands.get(name);
         if (entry != null && entry.command == owner) commands.remove(name);
     }

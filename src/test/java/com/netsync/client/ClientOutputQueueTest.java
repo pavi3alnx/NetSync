@@ -72,10 +72,12 @@ class ClientOutputQueueTest {
     @Test
     void coalescesStateAndMakesOverflowVisibleWithoutExceedingCapacity() throws Exception {
         CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1), completed = new CountDownLatch(1);
+        CountDownLatch commandWritten = new CountDownLatch(1);
         List<String> written = new CopyOnWriteArrayList<>();
         ClientOutputQueue output = new ClientOutputQueue(text -> {
             entered.countDown(); awaitUninterruptibly(release); written.add(text);
             if (text.startsWith("Client output was omitted")) completed.countDown();
+            if (text.equals("command error")) commandWritten.countDown();
         }, GENERATION::equals, 2);
         try {
             output.offerImportant("block", null);
@@ -87,6 +89,7 @@ class ClientOutputQueueTest {
             assertTrue(output.omittedCount() > 0);
             release.countDown();
             assertTrue(completed.await(2, TimeUnit.SECONDS));
+            assertTrue(commandWritten.await(2, TimeUnit.SECONDS));
             assertTrue(written.contains("correlated query result"));
             assertTrue(written.contains("command error"));
             assertFalse(written.contains("alice online"));

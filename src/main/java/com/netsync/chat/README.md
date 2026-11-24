@@ -49,7 +49,7 @@ The `com.netsync.chat` package provides private and direct real-time messaging b
 | **`ChatHandler`** | Implements `com.netsync.common.MessageHandler`. Entry point for `MessageType.CHAT_SEND`. Rejects unauthenticated connections and invalid requests. | Runs synchronously on the single NIO Selector thread. Never blocks. |
 | **`ChatService`** | Business logic coordinator. Validates message content (non-null, non-empty, max 4,096 UTF-8 bytes). Dispatches to `MessageRouter` and formats correlated `ACK` or `ERROR` frames. | Runs synchronously on the Selector thread. Pure in-memory operations. |
 | **`MessageRouter`** | Resolves `recipientClientId` to `SessionView` via `SessionRegistry`. Constructs `CHAT_DELIVER` frames and dispatches them via `OutboundSink`. Handles queue saturation. | Synchronous, non-blocking. Isolates slow consumers by catching queue saturation. |
-| **`ChatClientAdapter`** | Client-side integration for CLI shells (`NetSyncClient`). Registers the `/chat` command and listens for incoming `CHAT_DELIVER`, `ACK`, and `ERROR` responses with timestamps (`HH:mm:ss`). | Thread-safe; handles dispatch on client background thread. |
+| **`ChatClientAdapter`** | Production CLI integration. Registers `/chat`, validates authenticated session/generation, correlates bounded pending requests, and renders safe deliveries and terminal responses through the shared bounded client output queue. | Dispatch callbacks do bounded in-memory work and enqueue display output; one owned timer expires pending requests. |
 
 ---
 
@@ -102,7 +102,7 @@ Server sends to Sender upon enqueue acceptance:
   }
 }
 ```
-*Semantics: `ACK/QUEUED` guarantees that the recipient's output buffer accepted the message. It does not represent a read receipt.*
+*Semantics: `ACK/QUEUED` means the recipient's TCP output queue accepted the message. It does not prove network receipt or reading.*
 
 ### D. Error Responses (`ERROR`)
 Server sends to Sender on failure:
@@ -120,6 +120,8 @@ Server sends to Sender on failure:
 2. **Slow Consumer Isolation**: If a recipient's network buffer is saturated (`EnqueueResult.REJECTED`), `MessageRouter` immediately aborts delivery and returns `BUSY` to the sender. The NIO Selector loop is never blocked.
 3. **Session Integrity**: Sender ID is strictly populated from `SessionView.clientId()`. Identity spoofing via JSON payload injection is impossible.
 4. **Advisory Offline State**: Per `architecture.md`, UDP presence timeouts (marking a user `OFFLINE`) are advisory. If a user's TCP connection is active, direct chat remains fully routable.
+5. **Bounded client state**: At most 128 unanswered requests are tracked for up to 30 seconds. Timeout reports an unknown outcome; no automatic retry occurs. Requests are bound to the current TCP connection and authenticated client session, and cleared on logout, disconnect, reconnect or close.
+6. **Bounded output**: Deliveries and chat responses use the shared 64-entry CLI output queue. Distinct chat messages are never coalesced. Saturation produces the existing visible omission notice; consumer exceptions are contained by the output worker.
 
 ---
 
@@ -132,5 +134,7 @@ mvn test -Dtest="*Chat*,MessageRouterTest"
 
 To run the complete project verification:
 ```bash
-mvn clean test
+mvn -B clean verify
 ```
+
+For production CLI usage, see `src/main/java/com/netsync/client/README.md` and `docs/chat-demo.md`.

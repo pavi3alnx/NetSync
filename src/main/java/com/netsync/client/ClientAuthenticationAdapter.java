@@ -65,7 +65,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
     private final Set<Runnable> stateListeners = new LinkedHashSet<>();
 
     /** Internal composition notifications only enqueue bounded work; never perform I/O here. */
-    ClientDispatcher.Registration onStateChanged(Runnable signal) {
+    public ClientDispatcher.Registration onStateChanged(Runnable signal) {
         synchronized (client) { stateListeners.add(signal); }
         return () -> { synchronized (client) { stateListeners.remove(signal); } };
     }

@@ -19,8 +19,12 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.time.Duration;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -85,7 +89,7 @@ class ChatClientAdapterTest {
     }
 
     @Test
-    @DisplayName("Correlated ACK prints delivery confirmation")
+    @DisplayName("Correlated ACK reports queue acceptance without claiming delivery")
     void correlatedAckPrintsDeliveryConfirmation() throws Exception {
         commands.execute("/chat " + BOB_CLIENT_ID + " Ping");
         MessageEnvelope sent = (MessageEnvelope) outbound.sentFrames.getFirst();
@@ -100,7 +104,8 @@ class ChatClientAdapterTest {
 
         adapter.onAck(ack);
 
-        assertTrue(terminalOutput.stream().anyMatch(line -> line.contains("Delivered to server: " + BOB_CLIENT_ID)));
+        assertTrue(terminalOutput.stream().anyMatch(line -> line.contains("Queued for recipient " + BOB_CLIENT_ID)
+                && line.contains("does not confirm that it was read")));
     }
 
     @Test
@@ -119,7 +124,7 @@ class ChatClientAdapterTest {
 
         adapter.onError(error);
 
-        assertTrue(terminalOutput.stream().anyMatch(line -> line.contains("Delivery failed for message to " + BOB_CLIENT_ID)
+        assertTrue(terminalOutput.stream().anyMatch(line -> line.contains("Delivery failed for recipient " + BOB_CLIENT_ID)
                 && line.contains("RECIPIENT_UNAVAILABLE")));
     }
 
@@ -131,14 +136,117 @@ class ChatClientAdapterTest {
         assertThrows(CommandRegistry.InputException.class, () -> commands.execute("/chat " + BOB_CLIENT_ID + "   "));
     }
 
+    @Test
+    @DisplayName("Unrelated, duplicate, and unknown responses do not consume pending chat requests")
+    void responseCorrelationIsStrictAndTerminalOnlyOnce() throws Exception {
+        commands.execute("/chat " + BOB_CLIENT_ID + " Ping");
+        MessageEnvelope sent = (MessageEnvelope) outbound.sentFrames.getFirst();
+        adapter.onAck(new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(), sent.messageId(),
+                new MessageBody.Ack(MessageType.PRESENCE_QUERY, AckStatus.ACCEPTED, null)));
+        adapter.onError(new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), UUID.randomUUID(),
+                new MessageBody.Error(ErrorCode.INVALID_REQUEST, "safe", null)));
+        assertFalse(adapter.ownsResponse(new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), UUID.randomUUID(),
+                new MessageBody.Error(ErrorCode.INVALID_REQUEST, "unrelated", null))));
+        assertEquals(1, adapter.pendingRequestCountForTesting());
+
+        MessageEnvelope ack = new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(), sent.messageId(),
+                new MessageBody.Ack(MessageType.CHAT_SEND, AckStatus.QUEUED, null));
+        adapter.onAck(ack);
+        int outputCount = terminalOutput.size();
+        adapter.onAck(ack);
+        MessageEnvelope duplicateError = new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), sent.messageId(),
+                new MessageBody.Error(ErrorCode.RECIPIENT_UNAVAILABLE, "safe", null));
+        assertTrue(adapter.ownsResponse(duplicateError));
+        adapter.onError(duplicateError);
+        assertEquals(0, adapter.pendingRequestCountForTesting());
+        assertEquals(outputCount, terminalOutput.size());
+    }
+
+    @Test
+    @DisplayName("Rejected enqueue removes pending state and bounded timeout reports unknown outcome")
+    void rejectedEnqueueAndTimeoutAreBounded() throws Exception {
+        adapter.close();
+        AtomicLong clock = new AtomicLong();
+        outbound.result = EnqueueResult.REJECTED;
+        adapter = new ChatClientAdapter(outbound, dispatcher, commands, terminalOutput::add,
+                clock::get, Duration.ofSeconds(5), 1);
+        assertThrows(CommandRegistry.InputException.class, () -> commands.execute("/chat " + BOB_CLIENT_ID + " rejected"));
+        assertEquals(0, adapter.pendingRequestCountForTesting());
+
+        outbound.result = EnqueueResult.ACCEPTED;
+        commands.execute("/chat " + BOB_CLIENT_ID + " pending");
+        MessageEnvelope request = (MessageEnvelope) outbound.sentFrames.getFirst();
+        assertEquals(1, adapter.pendingRequestCountForTesting());
+        assertThrows(CommandRegistry.InputException.class, () -> commands.execute("/chat " + BOB_CLIENT_ID + " at-capacity"));
+        clock.set(TimeUnit.SECONDS.toNanos(5));
+        adapter.expirePendingForTesting();
+        assertEquals(0, adapter.pendingRequestCountForTesting());
+        assertTrue(terminalOutput.stream().anyMatch(line -> line.contains("outcome is unknown") && line.contains("No retry")));
+        MessageEnvelope lateError = new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), request.messageId(),
+                new MessageBody.Error(ErrorCode.RECIPIENT_UNAVAILABLE, "safe", null));
+        assertTrue(adapter.ownsResponse(lateError));
+        adapter.onError(lateError);
+        MessageEnvelope lateAck = new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(), request.messageId(),
+                new MessageBody.Ack(MessageType.CHAT_SEND, AckStatus.QUEUED, null));
+        adapter.onAck(lateAck);
+        assertEquals(0, adapter.pendingRequestCountForTesting());
+    }
+
+    @Test
+    @DisplayName("Concurrent request and response transitions keep pending storage consistent")
+    void concurrentPendingTransitionsRemainConsistent() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        try {
+            var sends = new CopyOnWriteArrayList<MessageEnvelope>();
+            for (int i = 0; i < 40; i++) {
+                int index = i;
+                pool.submit(() -> {
+                    try { commands.execute("/chat " + BOB_CLIENT_ID + " message " + index); }
+                    catch (Exception failure) { throw new CompletionException(failure); }
+                });
+            }
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(3, TimeUnit.SECONDS));
+            outbound.sentFrames.stream().filter(MessageEnvelope.class::isInstance)
+                    .map(MessageEnvelope.class::cast).forEach(sends::add);
+            assertEquals(40, sends.size());
+            ExecutorService responses = Executors.newFixedThreadPool(8);
+            try {
+                for (MessageEnvelope request : sends) responses.submit(() -> adapter.onAck(new MessageEnvelope(
+                        1, MessageType.ACK, UUID.randomUUID(), request.messageId(),
+                        new MessageBody.Ack(MessageType.CHAT_SEND, AckStatus.QUEUED, null))));
+                responses.shutdown();
+                assertTrue(responses.awaitTermination(3, TimeUnit.SECONDS));
+                assertEquals(0, adapter.pendingRequestCountForTesting());
+            } finally { responses.shutdownNow(); }
+        } finally { pool.shutdownNow(); }
+    }
+
+    @Test
+    @DisplayName("Terminal response tombstones stay bounded and do not claim unrelated module errors")
+    void terminalTombstonesRemainBounded() throws Exception {
+        for (int i = 0; i < ChatClientAdapter.MAX_PENDING_REQUESTS + 12; i++) {
+            commands.execute("/chat " + BOB_CLIENT_ID + " tombstone " + i);
+            MessageEnvelope request = (MessageEnvelope) outbound.sentFrames.getLast();
+            adapter.onAck(new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(), request.messageId(),
+                    new MessageBody.Ack(MessageType.CHAT_SEND, AckStatus.QUEUED, null)));
+        }
+        assertEquals(0, adapter.pendingRequestCountForTesting());
+        assertEquals(ChatClientAdapter.MAX_PENDING_REQUESTS, adapter.terminalTombstoneCountForTesting());
+        MessageEnvelope unrelated = new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), UUID.randomUUID(),
+                new MessageBody.Error(ErrorCode.BUSY, "safe", null));
+        assertFalse(adapter.ownsResponse(unrelated));
+    }
+
     static final class FakeClientOutbound implements ClientOutbound {
         final List<OutboundFrame> sentFrames = new ArrayList<>();
         boolean connected = true;
+        EnqueueResult result = EnqueueResult.ACCEPTED;
 
         @Override
         public EnqueueResult send(OutboundFrame frame) {
-            sentFrames.add(frame);
-            return EnqueueResult.ACCEPTED;
+            if (result == EnqueueResult.ACCEPTED) sentFrames.add(frame);
+            return result;
         }
 
         @Override

@@ -46,7 +46,8 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
     public synchronized Failure failure() { return failure; }
     @Override public synchronized boolean isConnected() { return state == State.CONNECTED; }
     public synchronized Optional<UUID> connectionId() { return isConnected() ? Optional.of(current.id) : Optional.empty(); }
-    synchronized boolean isGenerationCurrent(UUID id) { return current != null && current.id.equals(id); }
+    /** True while this generation remains current, including callbacks drained after orderly EOF. */
+    public synchronized boolean isGenerationCurrent(UUID id) { return current != null && current.id.equals(id); }
     synchronized boolean isGenerationActive(UUID id) {
         return current != null && current.id.equals(id) && state == State.CONNECTED;
     }
@@ -61,7 +62,7 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
     public synchronized void clearSession() { session = null; }
     boolean isDispatchThread() { return Thread.currentThread() == dispatchThread; }
     /** Client-internal lifecycle hook. Runs under the transport monitor: clear state only, never block. */
-    synchronized ClientDispatcher.Registration onDisconnect(BiConsumer<UUID, Failure> listener) {
+    public synchronized ClientDispatcher.Registration onDisconnect(BiConsumer<UUID, Failure> listener) {
         Objects.requireNonNull(listener);
         disconnectListeners.add(listener);
         return () -> { synchronized (TcpClient.this) { disconnectListeners.remove(listener); } };
