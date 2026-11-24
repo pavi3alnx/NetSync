@@ -314,6 +314,7 @@ public final class ChatClientAdapter implements Closeable {
         return timer.awaitTermination(timeout, unit);
     }
     boolean timerShutdownForTesting() { return timer.isShutdown(); }
+    Thread timerThreadForTesting() { return timerThread; }
 
     private void authenticationChanged() {
         if (closed || authentication == null) return;

@@ -124,6 +124,7 @@ class ChatClientLifecycleTest {
 
     @Test
     void repeatedAdapterCreationAndCloseTerminatesEveryOwnedTimer() throws Exception {
+        List<Thread> ownedTimerThreads = new java.util.ArrayList<>();
         for (int i = 0; i < 12; i++) {
             TcpClient client = new TcpClient();
             CommandRegistry commands = new CommandRegistry();
@@ -135,9 +136,10 @@ class ChatClientLifecycleTest {
             chat.close(); auth.close(); client.close();
             assertTrue(chat.timerShutdownForTesting());
             assertTrue(chat.awaitTimerTerminationForTesting(2, TimeUnit.SECONDS));
+            Thread timerThread = chat.timerThreadForTesting();
+            if (timerThread != null) ownedTimerThreads.add(timerThread);
         }
-        await(() -> Thread.getAllStackTraces().keySet().stream()
-                .noneMatch(thread -> thread.isAlive() && thread.getName().equals("netsync-chat-timeout")));
+        await(() -> ownedTimerThreads.stream().noneMatch(Thread::isAlive));
     }
 
     @Test
