@@ -58,11 +58,23 @@ class NetSyncServerApplicationTest {
     }
 
     private static MessageEnvelope read(Socket socket) throws Exception {
+        MessageEnvelope message;
+        do { message = readRaw(socket); }
+        while (message.type() == MessageType.PRESENCE_UPDATE);
+        return message;
+    }
+
+    private static MessageEnvelope readRaw(Socket socket) throws Exception {
         DataInputStream input = new DataInputStream(socket.getInputStream());
         int length = CODEC.decodeLength(ByteBuffer.wrap(input.readNBytes(4)));
         byte[] payload = input.readNBytes(length);
         assertEquals(length, payload.length);
         return assertInstanceOf(MessageEnvelope.class, CODEC.decodePayload(ByteBuffer.wrap(payload)));
+    }
+
+    private static void drainUntilEof(Socket socket) throws Exception {
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        while (input.read() >= 0) { /* shutdown may flush queued presence frames first */ }
     }
 
     private static MessageBody.LoginResponse login(Socket socket, String user) throws Exception {
@@ -104,7 +116,7 @@ class NetSyncServerApplicationTest {
             MessageEnvelope response = read(socket);
             error(response, request.messageId(), ErrorCode.AUTH_FAILED);
             assertEquals("Authentication failed", ((MessageBody.Error) response.body()).message());
-            assertEquals(-1, socket.getInputStream().read());
+            drainUntilEof(socket);
             assertTrue(app.sessions().activeSessions().isEmpty());
         }
     }
@@ -132,7 +144,7 @@ class NetSyncServerApplicationTest {
             var ack = assertInstanceOf(MessageBody.Ack.class, response.body());
             assertEquals(MessageType.LOGOUT_REQUEST, ack.operation());
             assertEquals(AckStatus.ACCEPTED, ack.status());
-            assertEquals(-1, socket.getInputStream().read());
+            drainUntilEof(socket);
             assertTrue(app.sessions().findByClientId(identity.clientId()).isEmpty());
             assertFalse(app.authentication().isPresenceTokenValid(identity.clientId(), identity.presenceToken()));
         }
@@ -167,8 +179,12 @@ class NetSyncServerApplicationTest {
                 var bob = login(second, "bob");
                 MessageEnvelope a = empty(MessageType.PRESENCE_QUERY), b = empty(MessageType.PRESENCE_QUERY);
                 write(first, a); write(second, b);
-                error(read(first), a.messageId(), ErrorCode.INVALID_REQUEST);
-                error(read(second), b.messageId(), ErrorCode.INVALID_REQUEST);
+                MessageEnvelope snapshotA = readUntilReply(first, a.messageId(), true);
+                MessageEnvelope snapshotB = readUntilReply(second, b.messageId(), true);
+                assertEquals(MessageType.PRESENCE_SNAPSHOT, snapshotA.type());
+                assertEquals(MessageType.PRESENCE_SNAPSHOT, snapshotB.type());
+                assertEquals(2, ((MessageBody.PresenceSnapshot) snapshotA.body()).clients().size());
+                assertEquals(2, ((MessageBody.PresenceSnapshot) snapshotB.body()).clients().size());
                 ConnectionContext ca = contexts.get(a.messageId()), cb = contexts.get(b.messageId());
                 assertEquals(alice.clientId(), ca.session().orElseThrow().clientId());
                 assertEquals(bob.clientId(), cb.session().orElseThrow().clientId());
@@ -177,6 +193,14 @@ class NetSyncServerApplicationTest {
                 assertEquals(cb.session(), app.sessions().findByConnectionId(cb.connectionId()));
             }
         }
+    }
+
+    private static MessageEnvelope readUntilReply(Socket socket, UUID replyTo, boolean expectReply) throws Exception {
+        MessageEnvelope message;
+        do { message = readRaw(socket); }
+        while (message.type() == MessageType.PRESENCE_UPDATE
+                || (expectReply && !replyTo.equals(message.replyTo())));
+        return message;
     }
 
     @Test void unauthenticatedConnectionExpiresWithProductionHandlersAndVirtualClock() throws Exception {
@@ -243,7 +267,7 @@ class NetSyncServerApplicationTest {
             app.close(); app.close();
             assertFalse(app.isRunning());
             assertTrue(app.workers().isTerminated());
-            assertEquals(-1, socket.getInputStream().read());
+            drainUntilEof(socket);
             assertTrue(app.sessions().activeSessions().isEmpty());
             assertFalse(app.authentication().isPresenceTokenValid(identity.clientId(), identity.presenceToken()));
             try (ServerSocket replacement = new ServerSocket(port, 1, InetAddress.getByName("127.0.0.1"))) {
@@ -317,6 +341,23 @@ class NetSyncServerApplicationTest {
         }
     }
 
+    @Test void udpBindFailureDoesNotLeaveTcpServerOrWorkersRunning() throws Exception {
+        try (DatagramSocket occupied = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
+            int udpPort = occupied.getLocalPort();
+            AtomicReference<TransferWorkerPool> pool = new AtomicReference<>();
+            DemoServerConfig config = new DemoServerConfig(true, 0, List.of("alice", "bob"), udpPort);
+            try (var app = new NetSyncServerApplication(config, accounts(), NioServer::new,
+                    () -> { var workers = new TransferWorkerPool(); pool.set(workers); return workers; })) {
+                assertThrows(java.io.IOException.class, app::start);
+                assertFalse(app.isRunning());
+                assertEquals(-1, app.port());
+                assertTrue(pool.get().isTerminated());
+                assertTrue(app.sessions().activeSessions().isEmpty());
+                app.close();
+            }
+        }
+    }
+
     @Test void constructionFailureAfterWorkerCreationRollsBackWorkers() throws Exception {
         AtomicReference<TransferWorkerPool> pool = new AtomicReference<>();
         try (var app = new NetSyncServerApplication(config(0), accounts(),
@@ -361,7 +402,9 @@ class NetSyncServerApplicationTest {
             error(read(socket), chunk.messageId(), ErrorCode.INVALID_REQUEST);
             MessageEnvelope query = empty(MessageType.PRESENCE_QUERY);
             write(socket, query);
-            error(read(socket), query.messageId(), ErrorCode.INVALID_REQUEST);
+            MessageEnvelope snapshot = readUntilReply(socket, query.messageId(), true);
+            assertEquals(MessageType.PRESENCE_SNAPSHOT, snapshot.type());
+            assertEquals(query.messageId(), snapshot.replyTo());
         }
     }
 }

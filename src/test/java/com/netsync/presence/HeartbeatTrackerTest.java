@@ -193,6 +193,32 @@ class HeartbeatTrackerTest {
         assertFalse(tracker.processHeartbeat(heartbeat(ALICE_ID, ALICE_TOKEN, 101)));
     }
 
+    @Test
+    void heartbeatRecoveryRacingWithExpiryLeavesTheFreshHeartbeatAuthoritative() throws Exception {
+        registry.add(ALICE_ID, ALICE_CONNECTION);
+        assertTrue(tracker.registerSession(ALICE_ID, ALICE_TOKEN));
+        time.advanceSeconds(15);
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            var expiry = executor.submit(() -> { await(start); tracker.checkTimeouts(); });
+            var recovery = executor.submit(() -> { await(start); return tracker.processHeartbeat(heartbeat(ALICE_ID, ALICE_TOKEN, 1)); });
+            start.countDown();
+            expiry.get(2, TimeUnit.SECONDS);
+            assertTrue(recovery.get(2, TimeUnit.SECONDS));
+        } finally { executor.shutdownNow(); }
+        assertEquals(Optional.of(PresenceState.ONLINE), tracker.getPresenceState(ALICE_ID));
+        long onlineCount = updates.stream().filter(update -> update.clientId().equals(ALICE_ID)
+                && update.state() == PresenceState.ONLINE).count();
+        assertTrue(onlineCount >= 1);
+        assertEquals(PresenceState.ONLINE, updates.getLast().state());
+    }
+
+    private static void await(CountDownLatch latch) {
+        try { latch.await(); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+    }
+
     private static Heartbeat heartbeat(UUID clientId, String token, long sequence) {
         return new Heartbeat(1, "HEARTBEAT", clientId, token, sequence);
     }

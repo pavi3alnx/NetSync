@@ -54,27 +54,25 @@ public final class HeartbeatTracker {
             return false;
         }
 
-        boolean notifyOnline;
         synchronized (sessions) {
+            if (sessionRegistry.findByClientId(clientId).isEmpty()
+                    || !tokenValidator.isValid(clientId, presenceToken)) return false;
             SessionPresence existing = sessions.get(clientId);
             if (existing != null
                     && existing.active
-                    && existing.presenceToken.equals(presenceToken)
-                    && existing.state == PresenceState.ONLINE) {
+                    && existing.presenceToken.equals(presenceToken)) {
                 return true;
             }
 
+            if (existing == null && sessions.size() >= ProtocolLimits.MAX_CONNECTIONS) return false;
             sessions.put(clientId, new SessionPresence(
                     presenceToken,
                     -1,
                     timeSource.nanoTime(),
                     PresenceState.ONLINE,
                     true));
-            notifyOnline = existing == null || existing.state == PresenceState.OFFLINE;
-        }
-
-        if (notifyOnline) {
-            listener.onPresenceChanged(clientId, PresenceState.ONLINE);
+            if (existing == null || existing.state == PresenceState.OFFLINE)
+                listener.onPresenceChanged(clientId, PresenceState.ONLINE);
         }
         return true;
     }
@@ -107,6 +105,8 @@ public final class HeartbeatTracker {
             SessionPresence session = sessions.get(clientId);
             if (session == null
                     || !session.active
+                    || sessionRegistry.findByClientId(clientId).isEmpty()
+                    || !tokenValidator.isValid(clientId, heartbeat.presenceToken())
                     || !session.presenceToken.equals(heartbeat.presenceToken())
                     || heartbeat.sequence() <= session.highestAcceptedSequence) {
                 return false;
@@ -118,9 +118,8 @@ public final class HeartbeatTracker {
                 session.state = PresenceState.ONLINE;
                 changes.add(new PresenceChange(clientId, PresenceState.ONLINE));
             }
+            notify(changes);
         }
-
-        notify(changes);
         return true;
     }
 
@@ -139,9 +138,8 @@ public final class HeartbeatTracker {
                     changes.add(new PresenceChange(entry.getKey(), PresenceState.OFFLINE));
                 }
             }
+            notify(changes);
         }
-
-        notify(changes);
     }
 
     public void revokeSession(UUID clientId) {
@@ -153,10 +151,7 @@ public final class HeartbeatTracker {
             if (session != null && session.state == PresenceState.ONLINE) {
                 change = new PresenceChange(clientId, PresenceState.OFFLINE);
             }
-        }
-
-        if (change != null) {
-            listener.onPresenceChanged(change.clientId(), change.state());
+            if (change != null) listener.onPresenceChanged(change.clientId(), change.state());
         }
     }
 

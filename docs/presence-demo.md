@@ -1,39 +1,46 @@
-# Member 3: UDP presence demo
+# Production presence demo
 
-This loopback-only automated demo exercises the real `UdpPresenceService` with actual UDP datagrams. It uses a test-only authenticated session and fixed test token; it does not start the application server, perform real authentication, or change production security behavior.
+This is an explicitly insecure, loopback-only demonstration. Use disposable account passwords. The TCP server and UDP presence service bind to `127.0.0.1`; the default ports are TCP `5050` and UDP `5051`.
 
-The test demonstrates:
+## Start the server
 
-1. The registered session appears as `ONLINE` in a `PRESENCE_SNAPSHOT`.
-2. Advancing the injected monotonic clock by 15 seconds, with no heartbeat, causes the real service's expiry scheduler to publish `OFFLINE`.
-3. A valid heartbeat sent over UDP to the running service restores `ONLINE`, and a later snapshot reflects the recovery.
-
-## Run from PowerShell
+From the repository root in PowerShell:
 
 ```powershell
-Set-Location C:\Users\ASUS\Desktop\NetSync
-
-# Run the local UDP demonstration and print its state transitions.
-mvn "-Dtest=UdpPresenceDemoTest" "-Dsurefire.useFile=false" test
-
-# Run all focused presence tests.
-mvn "-Dtest=HeartbeatTrackerTest,UdpPresenceServiceTest,PresenceHandlerTest,UdpPresenceDemoTest" test
-
-# Run the complete project test suite.
-mvn clean test
+mvn -B compile dependency:build-classpath "-Dmdep.outputFile=target/server-classpath.txt"
+$serverClasspath = "target/classes;" + (Get-Content -Raw target/server-classpath.txt).Trim()
+java -cp $serverClasspath com.netsync.app.NetSyncServerApplication --insecure-demo --users alice,bob --port 5050 --udp-port 5051
 ```
 
-The demonstration binds UDP to an ephemeral port on `127.0.0.1`, so it does not require the default application port or another user. Its successful output includes transitions and snapshots similar to:
+The options match `DemoServerConfig.parse`: `--insecure-demo` is required, `--users` supplies comma-separated usernames, `--port` selects TCP, and `--udp-port` selects UDP. The application prompts for each password using hidden console input. Keep this server terminal open.
 
-```text
-[Presence demo] transition demo_user=ONLINE
-[Presence demo] PRESENCE_SNAPSHOT demo_user=ONLINE
-[Presence demo] transition demo_user=OFFLINE
-[Presence demo] PRESENCE_SNAPSHOT demo_user=OFFLINE
-[Presence demo] transition demo_user=ONLINE
-[Presence demo] PRESENCE_SNAPSHOT demo_user=ONLINE
+## Start two clients
+
+In each of two separate PowerShell terminals, from the repository root, run:
+
+```powershell
+mvn -B compile dependency:build-classpath "-Dmdep.outputFile=target/server-classpath.txt"
+$clientClasspath = "target/classes;" + (Get-Content -Raw target/server-classpath.txt).Trim()
+java -cp $clientClasspath com.netsync.client.NetSyncClient
 ```
 
-The test clock advances by the protocol's 15-second timeout instead of waiting 15 wall-clock seconds. The UDP packet itself is sent through a real `DatagramSocket` to the real `UdpPresenceService`.
+Each client uses the production `NetSyncClient` entry point and hidden password input.
 
-This is a module demonstration, not the two-client application demo: production startup, login/logout callbacks, client heartbeat scheduling, and sending `PRESENCE_UPDATE` events to TCP clients still require application integration.
+In both client terminals:
+
+1. Run `/connect 127.0.0.1 5050 5051`.
+2. Complete `/login alice` in one client and `/login bob` in the other, entering the disposable passwords at the hidden prompt.
+3. Log in within **10 seconds of connecting**. Unauthenticated TCP connections are closed at the login deadline.
+4. Observe `Presence` ONLINE updates as each account logs in. Run `/presence` in either client to view the correlated snapshot.
+5. Run `/logout` in one client and observe the OFFLINE update in the other. Run `/disconnect` in the remaining client, then `/quit` to close it.
+6. Stop the server with Ctrl+C.
+
+Authenticated clients send a heartbeat every five seconds. Therefore an idle client with its automatic sender running remains ONLINE. To verify heartbeat expiry and recovery without waiting on manual terminal behavior, run the deterministic production-composition integration tests:
+
+```powershell
+mvn "-Dtest=PresenceProductionIntegrationTest" test
+```
+
+Those tests use the real application composition and UDP datagrams with an injected monotonic clock. A silent heartbeat stream becomes OFFLINE after the 15-second timeout while TCP authentication remains valid; a subsequent valid heartbeat restores ONLINE. `UdpPresenceDemoTest` separately covers the UDP service in isolation.
+
+The transport has no confidentiality and is unsuitable for untrusted networks or real credentials.

@@ -31,8 +31,8 @@ class ClientAuthenticationIntegrationTest {
         StringWriter output = new StringWriter();
         try (var server = server(); var cli = client(output, "disposable-alice")) {
             cli.execute("/help");
-            for (String command : List.of("/help", "/connect", "/disconnect", "/status", "/quit", "/login", "/logout"))
-                assertTrue(output.toString().contains(command));
+            await(() -> List.of("/help", "/connect", "/disconnect", "/status", "/quit", "/login", "/logout")
+                    .stream().allMatch(output.toString()::contains));
             connect(cli, server); cli.execute("/login alice");
             await(() -> cli.authentication().presenceCredentials().isPresent());
             var credentials = cli.authentication().presenceCredentials().orElseThrow();
@@ -116,6 +116,34 @@ class ClientAuthenticationIntegrationTest {
             cli.execute("/quit");
             assertTrue(cli.authentication().presenceCredentials().isEmpty());
             await(() -> server.sessions().activeSessions().isEmpty());
+        }
+    }
+
+    @Test void productionPresenceHeartbeatsQueryAndUpdatesReachOtherClient() throws Exception {
+        StringWriter outputA = new StringWriter(), outputB = new StringWriter();
+        try (var server = server();
+             var a = client(outputA, "disposable-alice");
+             var b = client(outputB, "disposable-bob")) {
+            a.execute("/connect 127.0.0.1 " + server.port() + " " + server.udpPort());
+            b.execute("/connect 127.0.0.1 " + server.port() + " " + server.udpPort());
+            a.execute("/login alice");
+            await(() -> a.authentication().presenceCredentials().isPresent());
+            await(() -> a.presence().isSendingHeartbeats());
+            b.execute("/login bob");
+            await(() -> b.authentication().presenceCredentials().isPresent());
+            await(() -> b.presence().isSendingHeartbeats());
+            var bob = b.authentication().presenceCredentials().orElseThrow();
+            await(() -> outputA.toString().contains("Presence: bob [" + bob.session().clientId() + "] is ONLINE."));
+            a.execute("/presence");
+            await(() -> outputA.toString().contains("Presence snapshot:")
+                    && outputA.toString().contains("alice [")
+                    && outputA.toString().contains("bob ["));
+            a.execute("/logout");
+            await(() -> !a.presence().isSendingHeartbeats() && !a.transport().isConnected());
+            await(() -> outputB.toString().contains("Presence: alice [")
+                    && outputB.toString().contains("is OFFLINE."));
+            assertFalse(outputA.toString().contains(a.authentication().presenceCredentials()
+                    .map(ClientAuthenticationAdapter.PresenceCredentials::presenceToken).orElse("never")));
         }
     }
 }

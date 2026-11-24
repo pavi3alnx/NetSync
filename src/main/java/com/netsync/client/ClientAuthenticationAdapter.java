@@ -50,6 +50,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
     private final TcpClient client;
     private final CommandRegistry commands;
     private final Consumer<String> output;
+    private final ClientOutputQueue outputQueue;
     private final PasswordInput passwords;
     private final LongSupplier nanoTime;
     private final long timeoutNanos;
@@ -61,6 +62,17 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
     private Pending pending;
     private PresenceCredentials credentials;
     private boolean closed;
+    private final Set<Runnable> stateListeners = new LinkedHashSet<>();
+
+    /** Internal composition notifications only enqueue bounded work; never perform I/O here. */
+    ClientDispatcher.Registration onStateChanged(Runnable signal) {
+        synchronized (client) { stateListeners.add(signal); }
+        return () -> { synchronized (client) { stateListeners.remove(signal); } };
+    }
+    private void stateChanged() { for (Runnable signal : List.copyOf(stateListeners)) signal.run(); }
+    public boolean isLoggingOut() {
+        synchronized (client) { return pending != null && pending.operation == MessageType.LOGOUT_REQUEST; }
+    }
 
     public ClientAuthenticationAdapter(TcpClient client, CommandRegistry commands,
                                         Consumer<String> output, PasswordInput passwords) {
@@ -70,9 +82,23 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
 
     ClientAuthenticationAdapter(TcpClient client, CommandRegistry commands, Consumer<String> output,
                                  PasswordInput passwords, LongSupplier nanoTime, Duration timeout) {
+        this(client, commands, output, null, passwords, nanoTime, timeout);
+    }
+
+    ClientAuthenticationAdapter(TcpClient client, CommandRegistry commands, ClientOutputQueue outputQueue,
+                                 PasswordInput passwords) {
+        this(client, commands, null, Objects.requireNonNull(outputQueue), passwords, System::nanoTime,
+                Duration.ofSeconds(ProtocolLimits.LOGIN_TIMEOUT_SECONDS));
+    }
+
+    private ClientAuthenticationAdapter(TcpClient client, CommandRegistry commands, Consumer<String> output,
+                                        ClientOutputQueue outputQueue, PasswordInput passwords,
+                                        LongSupplier nanoTime, Duration timeout) {
         this.client = Objects.requireNonNull(client);
         this.commands = Objects.requireNonNull(commands);
-        this.output = Objects.requireNonNull(output);
+        this.output = output;
+        this.outputQueue = outputQueue;
+        if (output == null && outputQueue == null) throw new NullPointerException("output");
         this.passwords = Objects.requireNonNull(passwords);
         this.nanoTime = Objects.requireNonNull(nanoTime);
         timeoutNanos = Objects.requireNonNull(timeout).toNanos();
@@ -152,7 +178,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
                 if (client.sendJson(new MessageEnvelope(ProtocolLimits.VERSION, MessageType.LOGOUT_REQUEST,
                         operation.id, null, new MessageBody.Empty())) != EnqueueResult.ACCEPTED)
                     throw new CommandRegistry.InputException("Logout request could not be queued.");
-                operation.sent = true; pending = operation;
+                operation.sent = true; pending = operation; stateChanged();
             } catch (ProtocolException invalid) { throw new CommandRegistry.InputException("Logout request failed."); }
         }
         emit("Logout requested.");
@@ -169,7 +195,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
     private boolean current(UUID connection) { return client.connectionId().filter(connection::equals).isPresent(); }
     private void refresh() {
         if (credentials != null && (!current(credentials.session().connectionId())
-                || client.session().filter(credentials.session()::equals).isEmpty())) credentials = null;
+                || client.session().filter(credentials.session()::equals).isEmpty())) { credentials = null; stateChanged(); }
     }
 
     private void disconnected(UUID connection, TcpClient.Failure reason) {
@@ -179,6 +205,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         // can still be correlated. It expires on the existing bounded request deadline.
         if (pending != null && pending.connection.equals(connection)
                 && (reason != TcpClient.Failure.REMOTE_CLOSED || !pending.sent)) pending = null;
+        stateChanged();
     }
 
     /** Returns only current credentials; disconnect/reconnect/close immediately makes access empty. */
@@ -200,8 +227,9 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         checkTimeouts();
         UUID disconnect = null;
         String notice;
+        Pending operation;
         synchronized (client) {
-            Pending operation = matching(message);
+            operation = matching(message);
             if (operation == null || operation.operation != MessageType.LOGIN_REQUEST
                     || !(message.body() instanceof MessageBody.LoginResponse response)) return;
             pending = null;
@@ -214,19 +242,21 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
                 client.supplySession(operation.connection, session);
                 credentials = new PresenceCredentials(session, response.presenceToken(),
                         response.heartbeatIntervalSeconds(), response.presenceTimeoutSeconds());
+                stateChanged();
                 notice = "Logged in as " + response.username() + " (client ID: " + response.clientId() + ").";
             }
         }
         if (disconnect != null) client.disconnect(disconnect);
-        emit(notice);
+        emit(notice, operation.connection);
     }
 
     private void errorResponse(MessageEnvelope message) {
         checkTimeouts();
         UUID disconnect = null;
         String notice;
+        Pending operation;
         synchronized (client) {
-            Pending operation = matching(message);
+            operation = matching(message);
             if (operation == null || !(message.body() instanceof MessageBody.Error error)) return;
             pending = null;
             if (operation.operation == MessageType.LOGIN_REQUEST) {
@@ -239,10 +269,11 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
                     clearIdentity(operation.connection); disconnect = operation.connection;
                 }
                 notice = "Logout failed (" + error.code() + ").";
+                stateChanged();
             }
         }
         if (disconnect != null) client.disconnect(disconnect);
-        emit(notice); // Never echo server-supplied error text.
+        emit(notice, operation.connection); // Never echo server-supplied error text.
     }
 
     private void acknowledgement(MessageEnvelope message) {
@@ -257,12 +288,13 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
             clearIdentity(disconnect);
         }
         client.disconnect(disconnect);
-        emit("Logged out.");
+        emit("Logged out.", disconnect);
     }
 
     private void clearIdentity(UUID connection) {
         if (credentials != null && credentials.session().connectionId().equals(connection)) credentials = null;
         if (current(connection)) client.clearSession();
+        stateChanged();
     }
 
     /** One periodic task, one pending operation; virtual monotonic time is injectable in tests. */
@@ -278,11 +310,18 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         }
         if (disconnect != null) {
             client.disconnect(disconnect);
-            emit("Authentication response timed out; original connection closed. Reconnect before trying again.");
+            emit("Authentication response timed out; original connection closed. Reconnect before trying again.", disconnect);
         }
     }
 
-    private void emit(String text) { try { output.accept(text); } catch (RuntimeException ignored) { } }
+    private void emit(String text) {
+        if (outputQueue != null) outputQueue.offer(text);
+        else try { output.accept(text); } catch (RuntimeException ignored) { }
+    }
+    private void emit(String text, UUID generation) {
+        if (outputQueue != null) outputQueue.offerImportant(text, generation);
+        else emit(text);
+    }
 
     @Override public void close() {
         UUID disconnect;
@@ -293,6 +332,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
             pending = null;
             if (disconnect != null) clearIdentity(disconnect);
             credentials = null;
+            stateChanged(); stateListeners.clear();
         }
         timer.shutdownNow();
         registrations.forEach(ClientDispatcher.Registration::close);
