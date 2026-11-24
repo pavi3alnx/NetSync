@@ -77,7 +77,8 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         Link link;
         synchronized (this) {
             if (state != State.DISCONNECTED) throw new IllegalStateException("Client is " + state);
-            if (current != null && (alive(current.reader) || alive(current.writer)))
+            if (current != null && (alive(current.reader) || alive(current.writer)
+                    || (current.remoteEof && (dispatch.getActiveCount() > 0 || !dispatch.getQueue().isEmpty()))))
                 throw new IllegalStateException("Previous connection is still stopping");
             if (current != null) current.cancelled = true;
             dispatch.getQueue().clear();
@@ -147,11 +148,14 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
                     synchronized (this) { protocolRejections++; }
                     continue;
                 }
+                if (!active(link)) return;
                 try {
                     dispatch.execute(() -> {
                         if (dispatchable(link) && !dispatcher.dispatch(frame, () -> dispatchable(link))) stop(link, Failure.NO_BINARY_HANDLER);
                     });
-                } catch (RejectedExecutionException e) { stop(link, Failure.DISPATCH_FULL); return; }
+                } catch (RejectedExecutionException e) {
+                    stop(link, Failure.DISPATCH_FULL); return;
+                }
             }
         } catch (EOFException e) { stop(link, Failure.REMOTE_CLOSED); }
         catch (SocketTimeoutException e) { stop(link, Failure.FRAME_TIMEOUT); }
@@ -174,7 +178,8 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         return bytes;
     }
     private synchronized boolean dispatchable(Link link) {
-        return current == link && !link.cancelled && state != State.CLOSED;
+        return current == link && !link.cancelled && state != State.CLOSED
+                && (state == State.CONNECTED || link.remoteEof);
     }
     private synchronized boolean active(Link link) { return current == link && state == State.CONNECTED; }
     private synchronized void stop(Link link, Failure reason) {
@@ -187,7 +192,9 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         session = null; link.output.clear(); link.bytes = 0;
         // Complete inbound frames preceding orderly EOF remain observable. Explicit
         // disconnect/reconnect, protocol failures and overload cancel pending callbacks.
-        if (reason != Failure.REMOTE_CLOSED) { link.cancelled = true; dispatch.getQueue().clear(); }
+        if (reason == Failure.REMOTE_CLOSED) {
+            link.remoteEof = true;
+        } else { link.cancelled = true; dispatch.getQueue().clear(); }
         if (!link.disconnectNotified) {
             link.disconnectNotified = true;
             for (var listener : List.copyOf(disconnectListeners)) {
@@ -237,6 +244,7 @@ public final class TcpClient implements ClientOutbound, AutoCloseable {
         final ArrayDeque<ByteBuffer> output = new ArrayDeque<>();
         int bytes;
         boolean cancelled;
+        boolean remoteEof;
         boolean disconnectNotified;
         Thread reader, writer;
     }
