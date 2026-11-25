@@ -40,6 +40,7 @@ public final class FileTransferClientService implements Closeable {
     private final Object lock = new Object();
     private volatile FileTransferEventListener eventListener;
     private FileSender activeSender;
+    private FileSender lastSender;
     private FileReceiver activeReceiver;
     private boolean senderStarting;
     private boolean closed;
@@ -124,6 +125,7 @@ public final class FileTransferClientService implements Closeable {
                 }
             });
             this.activeSender = sender;
+            this.lastSender = sender;
             this.senderStarting = true;
         }
 
@@ -641,6 +643,14 @@ public final class FileTransferClientService implements Closeable {
     public Optional<FileReceiver.ReceiverState> receiverState() {
         synchronized (lock) {
             return Optional.ofNullable(activeReceiver).map(FileReceiver::state);
+        }
+    }
+
+    boolean ownsErrorReply(UUID replyTo) {
+        if (replyTo == null) return false;
+        synchronized (lock) {
+            return (activeSender != null && activeSender.ownsErrorReply(replyTo))
+                    || (lastSender != null && lastSender.ownsErrorReply(replyTo));
         }
     }
 

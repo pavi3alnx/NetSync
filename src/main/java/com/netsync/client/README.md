@@ -1,8 +1,9 @@
 # NetSync client integration
 
 The client contains transport, dispatch, session access, an extensible CLI and
-production authentication, presence and private-chat adapters. It reuses the
-existing wire models and codecs. File transfer is not composed into this CLI.
+production authentication, presence, private-chat and file-transfer adapters.
+It reuses the existing wire models and codecs. Transfer events use the shared
+bounded output queue and are tied to their authenticated connection generation.
 
 ## Start the CLI (PowerShell, from the repository root)
 
@@ -23,6 +24,10 @@ Example commands:
 /login alice
 /presence
 /chat <recipientClientId> Hello there
+/sendfile <recipientClientId> <filePath>
+/accept <transferId>
+/reject <transferId>
+/cancel [transferId]
 /logout
 /quit
 ```
@@ -31,7 +36,8 @@ Default: `127.0.0.1:5050` TCP and UDP `5051`. The server must be started separat
 close the client. Input/output streams remain caller-owned. CLI input executes on
 the caller thread. Generic incoming messages display only type and ID; the chat
 adapter renders chat text and sender client IDs. Passwords and presence tokens are
-never rendered. Binary frames require an actual file-module receiver.
+never rendered. Downloads are stored under
+`data/uploads/clients/<authenticated-clientId>/<transferId>.bin`.
 
 ## Production authentication (Phase 1)
 
@@ -113,7 +119,7 @@ A timeout reports an unknown outcome and never resends. Logout, disconnect,
 reconnect and close clear session-bound chat state. Chat shares the bounded output
 worker with authentication and presence; saturation uses its visible omission
 notice. Presence expiry is advisory and does not revoke a live TCP chat session.
-File-transfer integration, TLS and remote deployment are not provided.
+TLS and remote deployment are not provided.
 
 ```powershell
 mvn -B "-Dtest=ClientAuthenticationAdapterTest,ClientAuthenticationIntegrationTest" test

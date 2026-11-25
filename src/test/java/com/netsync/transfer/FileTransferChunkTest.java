@@ -28,6 +28,14 @@ class FileTransferChunkTest {
     private TransferTestFixtures.TestAuthorizationService authService;
     private AtomicLong clockTime;
 
+    private void awaitStorageDeleted(UUID transferId) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (storage.exists(transferId) && System.nanoTime() < deadline) {
+            try { Thread.sleep(10); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        assertFalse(storage.exists(transferId));
+    }
+
     private FileTransferCoordinator coordinator;
 
     private TransferTestFixtures.TestConnectionContext senderContext;
@@ -126,7 +134,7 @@ class FileTransferChunkTest {
 
         // Transfer aborted and storage cleaned
         assertTrue(registry.get(transferId).isEmpty());
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
     }
 
     @Test
@@ -152,7 +160,7 @@ class FileTransferChunkTest {
         assertEquals(dupMsgId, err.replyTo());
 
         assertTrue(registry.get(transferId).isEmpty());
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
     }
 
     @Test
@@ -278,7 +286,7 @@ class FileTransferChunkTest {
 
         // Transfer slots freed and server partial file removed
         assertTrue(registry.get(transferId).isEmpty());
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
     }
 
     @Test
@@ -305,7 +313,7 @@ class FileTransferChunkTest {
         assertEquals(completeMsgId, err.replyTo());
 
         assertTrue(registry.get(transferId).isEmpty());
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
     }
 
     @Test

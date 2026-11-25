@@ -112,4 +112,18 @@ class SafeFileStorageTest {
             // In that case, the environment already prevents symbolic link creation
         }
     }
+
+    @Test
+    @DisplayName("Rejects a symlink in an ancestor of the configured storage root")
+    void symlinkAncestorProtection() throws Exception {
+        Path real = tempDir.resolve("real-parent");
+        Files.createDirectories(real);
+        Path link = tempDir.resolve("linked-parent");
+        try {
+            Files.createSymbolicLink(link, real);
+            assertThrows(SecurityException.class, () -> new SafeFileStorage(link.resolve("client-root")));
+        } catch (UnsupportedOperationException | FileSystemException e) {
+            // The operating system or test account can disallow symbolic-link creation.
+        }
+    }
 }

@@ -1,7 +1,7 @@
 # Production loopback demo application
 
-`com.netsync.app.NetSyncServerApplication` composes authentication, UDP presence
-and private TCP chat over the existing NIO server. The older `server.NioServer`
+`com.netsync.app.NetSyncServerApplication` composes authentication, UDP presence,
+private TCP chat, and consent-based file transfer over the existing NIO server. The older `server.NioServer`
 main remains a transport-only entry point; use the application main below.
 
 ## Start from PowerShell
@@ -39,8 +39,8 @@ untrusted networks/deployment. TCP is unencrypted; there is no TLS.
 - Real `LOGIN_REQUEST` / `LOGIN_RESPONSE`, `LOGOUT_REQUEST` / `ACK`, presence and `CHAT_SEND` handlers.
 - One security-owned session registry shared by authentication, authorization and
   the transport's live connection lookup.
-- Two bounded credential workers with 32 queued tasks, reusing
-  `TransferWorkerPool` as an executor only. No transfer service/storage starts.
+- One bounded two-thread worker pool with 32 queued tasks shared by authentication
+  and transfer disk/hash work.
 - Disconnect cancels pending authentication and revokes the session/token.
 - Failed login returns generic `AUTH_FAILED`, then closes after output drains.
 - Logout returns `ACK/ACCEPTED`, revokes the session, then closes after draining.
@@ -50,15 +50,20 @@ untrusted networks/deployment. TCP is unencrypted; there is no TLS.
   routes by recipient client ID through the shared session registry, and uses the
   same nonblocking outbound sink. A queued ACK confirms only recipient output-queue
   acceptance, not receipt or reading. UDP presence expiry does not revoke TCP chat
-  authorization. Binary frames still receive a bounded error response; there is no
-  file-transfer service or placeholder receiver.
+  authorization.
+- File controls and binary chunks use the same authenticated NIO connection and
+  session registry. The application owns transfer state, `data/uploads/server/`
+  relay storage, worker operations, disconnect cleanup, and a one-second timeout
+  scheduler for the documented 30-second transfer lifetime.
 
-`NetSyncClient` supplies production `/login`, `/logout`, `/presence` and
-`/chat <recipientClientId> <message>` commands. The UDP port defaults to 5051 and
+`NetSyncClient` supplies production `/login`, `/logout`, `/presence`, `/chat`,
+`/sendfile`, `/accept`, `/reject`, and `/cancel` commands. Client files are stored
+under `data/uploads/clients/<authenticated-clientId>/` with generated transfer-ID
+names. The UDP port defaults to 5051 and
 can be selected with `--udp-port`; both listeners bind only to loopback. Clients
 send heartbeats every five seconds and presence expires after fifteen seconds.
-See `docs/chat-demo.md` for the production demonstration. This is not a TLS,
-remote deployment or file-transfer demonstration.
+See `docs/chat-demo.md` and `docs/file-transfer-demo.md` for demonstrations. This
+is not a TLS or remote deployment.
 
 ## Stop and lifecycle
 

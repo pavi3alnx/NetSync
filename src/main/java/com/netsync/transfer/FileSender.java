@@ -85,6 +85,15 @@ public final class FileSender implements AutoCloseable {
         return transferId;
     }
 
+    boolean ownsErrorReply(UUID replyTo) {
+        if (replyTo == null) return false;
+        synchronized (stateLock) {
+            return replyTo.equals(offerMessageId)
+                    || replyTo.equals(pendingChunkMessageId)
+                    || replyTo.equals(completeMessageId);
+        }
+    }
+
     public boolean isActive() {
         return state == SenderState.OFFERING
                 || state == SenderState.AWAITING_ACCEPTANCE

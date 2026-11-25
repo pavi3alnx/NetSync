@@ -5,7 +5,7 @@ import com.netsync.common.*;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -37,6 +37,7 @@ public final class FileReceiver implements AutoCloseable {
     private final boolean ownsWorkerPool;
 
     private final Object stateLock = new Object();
+    private final Object ioLock = new Object();
     private volatile ReceiverState state = ReceiverState.IDLE;
 
     private UUID transferId;
@@ -50,9 +51,16 @@ public final class FileReceiver implements AutoCloseable {
     private TransferChecksum.Incremental incrementalChecksum;
     private String finalSha256;
     private Path finalFile;
+    private boolean finalPublished;
+    private CompletableFuture<Void> cleanupFuture = CompletableFuture.completedFuture(null);
 
     private CompletableFuture<FileTransferResult> completionFuture;
     private Consumer<FileTransferProgress> progressListener;
+    private boolean writePending;
+    private MessageBody.FileComplete deferredComplete;
+    private final ArrayDeque<FileChunk> queuedChunks = new ArrayDeque<>();
+    private long pendingBytes;
+    private static final int MAX_QUEUED_CHUNKS = 32;
 
     public FileReceiver(Consumer<OutboundFrame> frameSink, SafeFileStorage storage) {
         this(frameSink, storage, new TransferWorkerPool(2, 32), true);
@@ -184,10 +192,11 @@ public final class FileReceiver implements AutoCloseable {
             this.expectedNextSequence = 0;
             this.chunksReceived = 0;
             this.bytesReceived = 0;
+            this.pendingBytes = 0;
+            this.queuedChunks.clear();
+            this.writePending = false;
+            this.deferredComplete = null;
             this.incrementalChecksum = new TransferChecksum.Incremental();
-
-            // Clear any stale partial file
-            storage.deletePartialFile(transferId);
 
             state = ReceiverState.RECEIVING;
             future = this.completionFuture;
@@ -201,7 +210,21 @@ public final class FileReceiver implements AutoCloseable {
             );
         }
 
-        frameSink.accept(acceptEnvelope);
+        try {
+            workerPool.submit(() -> {
+                try {
+                    synchronized (ioLock) {
+                        synchronized (stateLock) {
+                            if (state != ReceiverState.RECEIVING || !transferId.equals(this.transferId)) return;
+                        }
+                        storage.deletePartialFile(transferId);
+                    }
+                    frameSink.accept(acceptEnvelope);
+                } catch (RuntimeException failure) { failTransfer("Unable to prepare receiver storage"); }
+            });
+        } catch (RuntimeException rejected) {
+            failTransfer("Receiver worker capacity is unavailable");
+        }
         return future;
     }
 
@@ -251,9 +274,9 @@ public final class FileReceiver implements AutoCloseable {
      */
     public void handleChunk(FileChunk chunk) {
         Objects.requireNonNull(chunk, "FileChunk must not be null");
-
-        FileTransferProgress progress = null;
         String failureReason = null;
+        UUID tid = chunk.transferId();
+        FileChunk firstToSchedule = null;
 
         synchronized (stateLock) {
             if (state != ReceiverState.RECEIVING || !chunk.transferId().equals(this.transferId)) {
@@ -261,56 +284,86 @@ public final class FileReceiver implements AutoCloseable {
             }
 
             // Sequence validation
-            if (chunk.sequence() < expectedNextSequence) {
+            int nextUnreserved = expectedNextSequence + (writePending ? 1 : 0) + queuedChunks.size();
+            if (chunk.sequence() < nextUnreserved) {
                 // Duplicate chunk; drop without mutating state or corrupting file
                 return;
             }
 
-            if (chunk.sequence() > expectedNextSequence) {
+            if (chunk.sequence() > nextUnreserved) {
                 // Out-of-order chunk! Sequence violation
-                failureReason = "Invalid chunk sequence: expected " + expectedNextSequence + " but got " + chunk.sequence();
+                failureReason = "Invalid chunk sequence: expected " + nextUnreserved + " but got " + chunk.sequence();
             } else {
                 byte[] data = chunk.data();
-
                 // Chunk size validation
                 if (data.length < 1 || data.length > ProtocolLimits.MAX_CHUNK_BYTES) {
                     failureReason = "Invalid chunk size: " + data.length;
-                } else if (bytesReceived + data.length > declaredSizeBytes) {
-                    failureReason = "Transfer size exceeded declared bounds: " + (bytesReceived + data.length) + " > " + declaredSizeBytes;
+                } else if (bytesReceived + pendingBytes + data.length > declaredSizeBytes) {
+                    failureReason = "Transfer size exceeded declared bounds";
                 } else {
                     // Protocol requirement: non-final chunk must be exactly 16,384 bytes
-                    boolean isFinalChunk = (bytesReceived + data.length == declaredSizeBytes);
+                    boolean isFinalChunk = (bytesReceived + pendingBytes + data.length == declaredSizeBytes);
                     if (!isFinalChunk && data.length != ProtocolLimits.MAX_CHUNK_BYTES) {
                         failureReason = "Non-final chunk size was " + data.length + " bytes (expected exactly " + ProtocolLimits.MAX_CHUNK_BYTES + ")";
+                    } else if (queuedChunks.size() >= MAX_QUEUED_CHUNKS) {
+                        failureReason = "Receiver pending chunk limit reached";
                     } else {
-                        try {
-                            storage.appendChunk(transferId, data);
-                            incrementalChecksum.update(data);
-                            expectedNextSequence++;
-                            chunksReceived++;
-                            bytesReceived += data.length;
-
-                            if (progressListener != null) {
-                                progress = new FileTransferProgress(transferId, bytesReceived, declaredSizeBytes, chunk.sequence());
-                            }
-                        } catch (IOException | RuntimeException e) {
-                            failureReason = "Disk append error: " + e.getMessage();
+                        pendingBytes += data.length;
+                        queuedChunks.addLast(new FileChunk(chunk.messageId(), tid, chunk.sequence(), data));
+                        if (!writePending) {
+                            writePending = true;
+                            firstToSchedule = queuedChunks.removeFirst();
                         }
                     }
                 }
             }
         }
+        if (failureReason != null) { failTransfer(failureReason); return; }
+        if (firstToSchedule != null) scheduleChunkWrite(firstToSchedule);
+    }
 
-        if (progress != null && progressListener != null) {
-            try {
-                progressListener.accept(progress);
-            } catch (Exception ignored) {
+    private void scheduleChunkWrite(FileChunk chunk) {
+        try { workerPool.submit(() -> appendChunkOnWorker(chunk)); }
+        catch (RuntimeException rejected) { failTransfer("Receiver worker capacity is unavailable"); }
+    }
+
+    private void appendChunkOnWorker(FileChunk chunk) {
+        FileTransferProgress progress = null;
+        MessageBody.FileComplete completion = null;
+        FileChunk next = null;
+        UUID tid = chunk.transferId();
+        byte[] data = chunk.data();
+        try {
+            synchronized (ioLock) {
+                synchronized (stateLock) {
+                    if (state != ReceiverState.RECEIVING || !tid.equals(transferId)) return;
+                }
+                storage.appendChunk(tid, data);
             }
+            synchronized (stateLock) {
+                if (state != ReceiverState.RECEIVING || !tid.equals(transferId)) return;
+                incrementalChecksum.update(data);
+                expectedNextSequence++;
+                chunksReceived++;
+                bytesReceived += data.length;
+                pendingBytes -= data.length;
+                progress = new FileTransferProgress(tid, bytesReceived, declaredSizeBytes, chunk.sequence());
+                if (!queuedChunks.isEmpty()) next = queuedChunks.removeFirst();
+                else {
+                    writePending = false;
+                    completion = deferredComplete;
+                    deferredComplete = null;
+                }
+            }
+        } catch (IOException | RuntimeException failure) {
+            synchronized (stateLock) { writePending = false; }
+            failTransfer("Disk append error");
+            return;
         }
-
-        if (failureReason != null) {
-            failTransfer(failureReason);
-        }
+        Consumer<FileTransferProgress> listener = progressListener;
+        if (listener != null && progress != null) try { listener.accept(progress); } catch (RuntimeException ignored) { }
+        if (next != null) { scheduleChunkWrite(next); return; }
+        if (completion != null) verifyAndFinalize(completion);
     }
 
     private void handleFileComplete(MessageEnvelope envelope) {
@@ -322,70 +375,77 @@ public final class FileReceiver implements AutoCloseable {
             return;
         }
 
-        workerPool.submit(() -> verifyAndFinalize(complete));
+        if (writePending) { deferredComplete = complete; return; }
+        try { workerPool.submit(() -> verifyAndFinalize(complete)); }
+        catch (RuntimeException rejected) { failTransfer("Receiver worker capacity is unavailable"); }
     }
 
     private void verifyAndFinalize(MessageBody.FileComplete complete) {
-        MessageEnvelope receivedEnvelope = null;
         String failureReason = null;
-
+        UUID tid;
+        String computedHash = null;
+        Path partFile = null;
+        Path destination = null;
+        boolean emptyFile;
         synchronized (stateLock) {
-            if (state != ReceiverState.RECEIVING) {
-                return;
-            }
-
-            // Validate chunk count
+            if (state != ReceiverState.RECEIVING || !complete.transferId().equals(transferId)) return;
+            emptyFile = declaredSizeBytes == 0;
             if (complete.chunkCount() != chunksReceived) {
                 failureReason = "Chunk count mismatch: expected " + complete.chunkCount() + " but received " + chunksReceived;
             } else if (bytesReceived != declaredSizeBytes) {
                 failureReason = "Byte count mismatch: declared " + declaredSizeBytes + " but received " + bytesReceived;
             } else {
-                // Validate SHA-256
-                String computedHash = (declaredSizeBytes == 0)
+                computedHash = (declaredSizeBytes == 0)
                         ? TransferChecksum.EMPTY_SHA256
                         : incrementalChecksum.digestHex();
-
                 if (!TransferChecksum.matches(complete.sha256(), computedHash)) {
                     failureReason = "Checksum mismatch: expected " + complete.sha256() + " but computed " + computedHash;
                 } else {
                     this.finalSha256 = computedHash;
-
-                    // Finalize file
+                    this.state = ReceiverState.AWAITING_RECEIVED_ACK;
+                    tid = transferId;
                     try {
-                        Path partFile = storage.resolvePartFile(transferId);
-                        finalFile = storage.rootDir().resolve(transferId + ".bin");
-
-                        if (declaredSizeBytes == 0) {
-                            if (Files.exists(partFile)) {
-                                Files.move(partFile, finalFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                            } else {
-                                Files.createFile(finalFile);
-                            }
-                        } else {
-                            Files.move(partFile, finalFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                        }
-
-                        state = ReceiverState.AWAITING_RECEIVED_ACK;
-
-                        receivedEnvelope = new MessageEnvelope(
-                                ProtocolLimits.VERSION,
-                                MessageType.FILE_RECEIVED,
-                                UUID.randomUUID(),
-                                null,
-                                new MessageBody.FileReceived(transferId, finalSha256)
-                        );
-                    } catch (IOException e) {
-                        failureReason = "Finalization I/O error: " + e.getMessage();
+                        partFile = storage.resolvePartFile(tid);
+                        destination = storage.resolveFinalFile(tid);
+                        finalFile = destination;
+                    } catch (RuntimeException invalidStorage) {
+                        failureReason = "Finalization path validation failed";
+                    }
+                    if (failureReason == null) {
+                        // Paths and the state are captured; filesystem operations happen outside stateLock.
                     }
                 }
             }
+            tid = transferId;
         }
 
         if (failureReason != null) {
             failTransfer(failureReason);
-        } else if (receivedEnvelope != null) {
-            frameSink.accept(receivedEnvelope);
+            return;
         }
+
+        try {
+            synchronized (ioLock) {
+                synchronized (stateLock) {
+                    if (state != ReceiverState.AWAITING_RECEIVED_ACK || !tid.equals(transferId)) return;
+                }
+                if (emptyFile && !Files.exists(partFile)) Files.createFile(destination);
+                else Files.move(partFile, destination); // No replace option: collisions preserve existing bytes.
+                boolean stillOwned;
+                synchronized (stateLock) {
+                    stillOwned = state == ReceiverState.AWAITING_RECEIVED_ACK && tid.equals(transferId);
+                }
+                if (!stillOwned) { Files.deleteIfExists(destination); return; }
+                    synchronized (stateLock) { finalPublished = true; }
+            }
+        } catch (IOException | RuntimeException failure) {
+            failTransfer("Finalization failed");
+            return;
+        }
+        try {
+            frameSink.accept(new MessageEnvelope(ProtocolLimits.VERSION, MessageType.FILE_RECEIVED,
+                    UUID.randomUUID(), null, new MessageBody.FileReceived(tid, computedHash)));
+        } catch (RuntimeException failure) { failTransfer("Unable to send recipient integrity confirmation"); }
     }
 
     private void handleAck(MessageEnvelope envelope) {
@@ -412,14 +472,14 @@ public final class FileReceiver implements AutoCloseable {
 
         switch (status.state()) {
             case CANCELLED -> {
-                storage.deletePartialFile(transferId);
+                cleanupPartialAsync(transferId);
                 state = ReceiverState.CANCELLED;
                 if (completionFuture != null) {
                     completionFuture.complete(FileTransferResult.cancelled(transferId, status.reason()));
                 }
             }
             case FAILED -> {
-                storage.deletePartialFile(transferId);
+                cleanupPartialAsync(transferId);
                 state = ReceiverState.FAILED;
                 if (completionFuture != null) {
                     completionFuture.complete(FileTransferResult.failed(transferId, status.reason()));
@@ -437,7 +497,7 @@ public final class FileReceiver implements AutoCloseable {
         }
 
         if (transferId != null && transferId.equals(error.transferId())) {
-            storage.deletePartialFile(transferId);
+            cleanupPartialAsync(transferId);
             state = ReceiverState.FAILED;
             if (completionFuture != null) {
                 completionFuture.complete(FileTransferResult.failed(transferId, error.message()));
@@ -451,10 +511,13 @@ public final class FileReceiver implements AutoCloseable {
 
         synchronized (stateLock) {
             tid = transferId;
-            storage.deletePartialFile(tid);
             state = ReceiverState.FAILED;
+            queuedChunks.clear();
+            pendingBytes = 0;
+            deferredComplete = null;
             future = completionFuture;
         }
+        cleanupPartialAsync(tid);
 
         if (tid != null) {
             try {
@@ -487,10 +550,13 @@ public final class FileReceiver implements AutoCloseable {
             }
 
             tid = transferId;
-            storage.deletePartialFile(tid);
             state = ReceiverState.CANCELLED;
+            queuedChunks.clear();
+            pendingBytes = 0;
+            deferredComplete = null;
             future = completionFuture;
         }
+        cleanupPartialAsync(tid);
 
         if (tid != null) {
             try {
@@ -517,4 +583,54 @@ public final class FileReceiver implements AutoCloseable {
             workerPool.close();
         }
     }
+
+    private void cleanupPartialAsync(UUID tid) {
+        if (tid == null) return;
+        CompletableFuture<Void> completion = new CompletableFuture<>();
+        synchronized (stateLock) { cleanupFuture = completion; }
+        try {
+            workerPool.submit(() -> {
+                try {
+                    synchronized (ioLock) {
+                        for (int attempt = 0; attempt < 50 && storage.exists(tid); attempt++) {
+                            if (storage.deletePartialFile(tid) || !storage.exists(tid)) break;
+                            if (attempt < 49) {
+                                try {
+                                    Thread.sleep(10L);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    break;
+                                }
+                            }
+                        }
+                        if (storage.exists(tid)) {
+                            completion.completeExceptionally(new IOException("Persistent partial file deletion failure for " + tid));
+                            return;
+                        }
+                        Path published = storage.resolveFinalFile(tid);
+                        boolean deletePublished;
+                        synchronized (stateLock) {
+                            deletePublished = finalPublished;
+                            finalPublished = false;
+                        }
+                        if (deletePublished) {
+                            try {
+                                Files.deleteIfExists(published);
+                            } catch (IOException e) {
+                                completion.completeExceptionally(e);
+                                return;
+                            }
+                        }
+                    }
+                    completion.complete(null);
+                } catch (RuntimeException failure) {
+                    completion.completeExceptionally(failure);
+                }
+            });
+        } catch (RuntimeException rejected) {
+            completion.completeExceptionally(rejected);
+        }
+    }
+
+    CompletableFuture<Void> cleanupCompletion() { synchronized (stateLock) { return cleanupFuture; } }
 }

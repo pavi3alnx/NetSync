@@ -6,12 +6,15 @@ import com.netsync.presence.*;
 import com.netsync.chat.ChatHandler;
 import com.netsync.server.MessageDispatcher;
 import com.netsync.server.NioServer;
-import com.netsync.transfer.TransferWorkerPool;
+import com.netsync.transfer.*;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
@@ -34,12 +37,17 @@ public final class NetSyncServerApplication implements AutoCloseable {
     private final AuthorizationServiceImpl authorization;
     private final ServerFactory serverFactory;
     private final Supplier<TransferWorkerPool> workerFactory;
+    private final Supplier<SafeFileStorage> transferStorageFactory;
+    private final Supplier<Long> transferClock;
     private TransferWorkerPool workers;
     private NioServer server;
     private State state = State.NEW;
     private HeartbeatTracker presence;
     private PresenceEventPublisher publisher;
     private UdpPresenceService udp;
+    private SafeFileStorage transferStorage;
+    private FileTransferCoordinator transferCoordinator;
+    private ScheduledExecutorService transferTimeouts;
     private final HeartbeatTracker.TimeSource presenceClock;
     private int boundUdpPort = -1;
 
@@ -56,6 +64,22 @@ public final class NetSyncServerApplication implements AutoCloseable {
     NetSyncServerApplication(DemoServerConfig config, CredentialStore credentials,
                              ServerFactory serverFactory, Supplier<TransferWorkerPool> workerFactory,
                              HeartbeatTracker.TimeSource presenceClock) {
+        this(config, credentials, serverFactory, workerFactory, presenceClock, SafeFileStorage::new);
+    }
+
+    NetSyncServerApplication(DemoServerConfig config, CredentialStore credentials,
+                             ServerFactory serverFactory, Supplier<TransferWorkerPool> workerFactory,
+                             HeartbeatTracker.TimeSource presenceClock,
+                             Supplier<SafeFileStorage> transferStorageFactory) {
+        this(config, credentials, serverFactory, workerFactory, presenceClock, transferStorageFactory,
+                System::currentTimeMillis);
+    }
+
+    NetSyncServerApplication(DemoServerConfig config, CredentialStore credentials,
+                             ServerFactory serverFactory, Supplier<TransferWorkerPool> workerFactory,
+                             HeartbeatTracker.TimeSource presenceClock,
+                             Supplier<SafeFileStorage> transferStorageFactory,
+                             Supplier<Long> transferClock) {
         this.config = Objects.requireNonNull(config);
         Objects.requireNonNull(credentials);
         if (credentials.accountCount() == 0 || credentials.accountCount() > ProtocolLimits.MAX_CONNECTIONS)
@@ -65,6 +89,8 @@ public final class NetSyncServerApplication implements AutoCloseable {
         this.serverFactory = Objects.requireNonNull(serverFactory);
         this.workerFactory = Objects.requireNonNull(workerFactory);
         this.presenceClock = Objects.requireNonNull(presenceClock);
+        this.transferStorageFactory = Objects.requireNonNull(transferStorageFactory);
+        this.transferClock = Objects.requireNonNull(transferClock);
     }
 
     /** Single-use owner; create another instance to restart. Returns after a successful TCP bind. */
@@ -73,6 +99,8 @@ public final class NetSyncServerApplication implements AutoCloseable {
         LOG.log(System.Logger.Level.WARNING, WARNING);
         try {
             workers = Objects.requireNonNull(workerFactory.get());
+            transferStorage = Objects.requireNonNull(transferStorageFactory.get());
+            AtomicReference<FileTransferCoordinator> coordinatorRef = new AtomicReference<>();
             server = Objects.requireNonNull(serverFactory.create(config.port(), nio -> {
                 nio.withSessionRegistry(sessions);
                 publisher = new PresenceEventPublisher(nio.selectorTasks(), sessions, nio);
@@ -80,6 +108,8 @@ public final class NetSyncServerApplication implements AutoCloseable {
                 java.util.function.Consumer<SessionView> revoke = session -> {
                     presence.revokeSession(session.clientId());
                     publisher.forgetSession(session.clientId());
+                    FileTransferCoordinator coordinator = coordinatorRef.get();
+                    if (coordinator != null) coordinator.onDisconnected(session.connectionId());
                 };
                 LoginHandler login = new LoginHandler(authentication, workers::submit,
                         nio.selectorTasks(), nio, nio, result -> {
@@ -91,11 +121,23 @@ public final class NetSyncServerApplication implements AutoCloseable {
                         }, revoke);
                 LogoutHandler logout = new LogoutHandler(authentication, authorization, nio, nio, revoke);
                 nio.addDisconnectListener(login::onDisconnected);
+                transferCoordinator = new FileTransferCoordinator(new FileTransferService(
+                        new TransferRegistry(), transferStorage, workers, nio, nio.selectorTasks(), sessions, authorization,
+                        transferClock));
+                coordinatorRef.set(transferCoordinator);
+                nio.addDisconnectListener(transferCoordinator::onDisconnected);
                 MessageDispatcher dispatcher = MessageDispatcher.builder()
                         .register(MessageType.LOGIN_REQUEST, login)
                         .register(MessageType.LOGOUT_REQUEST, logout)
                         .register(MessageType.PRESENCE_QUERY, new PresenceHandler(authorization, sessions, presence, nio))
                         .register(MessageType.CHAT_SEND, new ChatHandler(sessions, authorization, nio))
+                        .register(MessageType.FILE_OFFER, transferCoordinator::handleControl)
+                        .register(MessageType.FILE_ACCEPT, transferCoordinator::handleControl)
+                        .register(MessageType.FILE_REJECT, transferCoordinator::handleControl)
+                        .register(MessageType.FILE_COMPLETE, transferCoordinator::handleControl)
+                        .register(MessageType.FILE_RECEIVED, transferCoordinator::handleControl)
+                        .register(MessageType.FILE_CANCEL, transferCoordinator::handleControl)
+                        .register(MessageType.FILE_STATUS, transferCoordinator::handleControl)
                         .build(nio);
                 return (context, message) -> {
                     if (message.type() != MessageType.LOGIN_REQUEST
@@ -103,9 +145,11 @@ public final class NetSyncServerApplication implements AutoCloseable {
                         reject(nio, context, message.messageId(), null, ErrorCode.UNAUTHENTICATED);
                     } else dispatcher.handle(context, message);
                 };
-            }, (context, chunk) -> reject(server, context, chunk.messageId(), chunk.transferId(),
-                    authorization.authenticatedSession(context).isEmpty()
-                            ? ErrorCode.UNAUTHENTICATED : ErrorCode.INVALID_REQUEST)));
+            }, (context, chunk) -> {
+                FileTransferCoordinator coordinator = coordinatorRef.get();
+                if (coordinator == null) reject(server, context, chunk.messageId(), chunk.transferId(), ErrorCode.INVALID_REQUEST);
+                else coordinator.handleChunk(context, chunk);
+            }));
             udp = new UdpPresenceService(new InetSocketAddress(ProtocolLimits.BIND_ADDRESS, config.udpPort()),
                     presence, publisher::retryPending);
             // Reserve UDP without loops first; TCP only starts once both sockets can bind.
@@ -113,6 +157,17 @@ public final class NetSyncServerApplication implements AutoCloseable {
             boundUdpPort = udp.getLocalAddress().getPort();
             server.start();
             udp.start();
+            transferTimeouts = Executors.newSingleThreadScheduledExecutor(task -> {
+                Thread thread = new Thread(task, "netsync-transfer-timeouts");
+                thread.setDaemon(true);
+                return thread;
+            });
+            transferTimeouts.scheduleWithFixedDelay(() -> {
+                NioServer currentServer = server;
+                FileTransferCoordinator currentCoordinator = transferCoordinator;
+                if (currentServer != null && currentCoordinator != null && currentServer.isRunning())
+                    currentServer.selectorTasks().submit(() -> currentCoordinator.service().checkTimeouts());
+            }, 1, 1, TimeUnit.SECONDS);
             state = State.RUNNING;
         } catch (IOException | RuntimeException failure) {
             close();
@@ -136,14 +191,19 @@ public final class NetSyncServerApplication implements AutoCloseable {
     public synchronized IOException failure() { return server == null ? null : server.failure(); }
     /** The one authoritative registry, exposed through its read-only shared contract. */
     public SessionRegistry sessions() { return sessions; }
+    FileTransferCoordinator transferCoordinator() { return transferCoordinator; }
+    SafeFileStorage transferStorage() { return transferStorage; }
     AuthService authentication() { return authentication; }
     TransferWorkerPool workers() { return workers; }
+    ScheduledExecutorService transferTimeoutsForTest() { return transferTimeouts; }
+    NioServer serverForTest() { return server; }
 
     /** Transport first cancels pending logins/revokes sessions; then stop bounded credential work. */
     @Override public synchronized void close() {
         if (state == State.CLOSED) return;
         state = State.CLOSED;
         try {
+            if (transferTimeouts != null) transferTimeouts.shutdownNow();
             if (udp != null) udp.stop();
             if (server != null) server.close();
         } finally {

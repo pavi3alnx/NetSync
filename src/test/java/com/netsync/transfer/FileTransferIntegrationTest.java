@@ -27,6 +27,13 @@ import static org.junit.jupiter.api.Assertions.*;
  * server and authentication module remains pending Member 1 and Member 4 implementations.
  */
 class FileTransferIntegrationTest {
+    private void awaitStorageDeleted(SafeFileStorage storage, UUID transferId) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (storage.exists(transferId) && System.nanoTime() < deadline) {
+            try { Thread.sleep(10); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        assertFalse(storage.exists(transferId));
+    }
 
     @TempDir
     Path tempDir;
@@ -163,7 +170,7 @@ class FileTransferIntegrationTest {
         // Step 7: Complete Transfer 1
         completeTransfer(aliceCtx, bobCtx, t1, 2, t1Sha256);
         assertEquals(1, registry.activeCount());
-        assertFalse(storage.exists(t1));
+        awaitStorageDeleted(storage, t1);
 
         // Step 8: Interleave chat message 4 (Dave -> Charlie: "Received all chunks!")
         sendChat(daveCtx, charlie.clientId(), "Received all chunks!");
@@ -173,7 +180,7 @@ class FileTransferIntegrationTest {
         // Step 9: Complete Transfer 2
         completeTransfer(charlieCtx, daveCtx, t2, 2, t2Sha256);
         assertEquals(0, registry.activeCount());
-        assertFalse(storage.exists(t2));
+        awaitStorageDeleted(storage, t2);
 
         // Step 10: Verify all 4 chat messages were delivered without interference
         List<MessageEnvelope> deliveredChats = chatHandler.deliveredChats();

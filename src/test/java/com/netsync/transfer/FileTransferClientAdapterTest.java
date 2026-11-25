@@ -91,10 +91,12 @@ class FileTransferClientAdapterTest {
             PrintWriter pw = new PrintWriter(sw, true);
             NetSyncClient cli = new NetSyncClient(client, pw);
 
-            try (FileTransferClientAdapter adapter = new FileTransferClientAdapter(cli, pw)) {
+            try (cli) {
+                FileTransferClientAdapter adapter = cli.fileTransfer();
                 assertSame(client, adapter.client());
                 assertSame(cli.commands(), adapter.commandRegistry());
                 assertFalse(adapter.isClosed());
+                assertTrue(cli.commands().descriptions().stream().anyMatch(d -> d.name().equals("/sendfile")));
             }
         }
     }
@@ -851,6 +853,221 @@ class FileTransferClientAdapterTest {
                                 && line.contains("inbound.txt")));
                     }
                 }
+            }
+        }
+    }
+
+    @RepeatedTest(20)
+    void oldGenerationSenderReadAndStaleCallbacksCannotAffectNewGenerationAfterReconnect() throws Exception {
+        try (ServerSocket server = new ServerSocket(0); TcpClient client = new TcpClient()) {
+            CommandRegistry registry = new CommandRegistry();
+            CountDownLatch workerEntered = new CountDownLatch(1);
+            CountDownLatch releaseOldWorker = new CountDownLatch(1);
+            CountDownLatch oldWorkerFinished = new CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicBoolean interceptNextWorker = new java.util.concurrent.atomic.AtomicBoolean(false);
+            TransferWorkerPool controlledPool = new TransferWorkerPool(2, 32);
+
+            try (FileTransferClientAdapter adapter = new FileTransferClientAdapter(
+                    client, registry, (text, gen) -> outputLines.add(gen + ":" + text),
+                    downloadsDir, () -> client.session().map(s -> downloadsDir.resolve(s.clientId().toString())).orElse(null),
+                    controlledPool)) {
+
+                // Connect Generation 1
+                client.connect("127.0.0.1", server.getLocalPort());
+                Socket peer1 = server.accept();
+                UUID gen1 = client.connectionId().orElseThrow();
+                UUID clientId1 = UUID.randomUUID();
+                client.supplySession(gen1, new SessionView(clientId1, "alice", gen1));
+
+                Path source1 = createTestFile("gen1.bin", 1024);
+                UUID recipient = UUID.randomUUID();
+                registry.execute("/sendfile " + recipient + " \"" + source1.toString().replace('\\', '/') + "\"");
+
+                // Read FILE_OFFER from peer1
+                peer1.setSoTimeout(3000);
+                java.io.DataInputStream dis1 = new java.io.DataInputStream(peer1.getInputStream());
+                int len1 = dis1.readInt();
+                MessageEnvelope offer1 = (MessageEnvelope) CODEC.decodePayload(java.nio.ByteBuffer.wrap(dis1.readNBytes(len1)));
+                assertEquals(MessageType.FILE_OFFER, offer1.type());
+
+                UUID oldTid = UUID.randomUUID();
+                // Send ACK(FILE_OFFER) and FILE_STATUS(ACCEPTED)
+                sendWireFrame(peer1, new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(), offer1.messageId(),
+                        new MessageBody.Ack(MessageType.FILE_OFFER, AckStatus.ACCEPTED, oldTid)));
+
+                // Occupy both worker threads so the sender chunk read task is queued until we reconnect
+                CountDownLatch occupyEntered = new CountDownLatch(2);
+                for (int i = 0; i < 2; i++) {
+                    controlledPool.submit(() -> {
+                        occupyEntered.countDown();
+                        try { releaseOldWorker.await(5, TimeUnit.SECONDS); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    });
+                }
+                assertTrue(occupyEntered.await(2, TimeUnit.SECONDS));
+
+                sendWireFrame(peer1, new MessageEnvelope(1, MessageType.FILE_STATUS, UUID.randomUUID(), null,
+                        new MessageBody.FileStatus(oldTid, FileStatusState.ACCEPTED, "accepted")));
+
+                // Wait until FILE_STATUS(ACCEPTED) is dispatched and queues readAndSendNextChunk
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                while (controlledPool.queueSize() < 1 && System.nanoTime() < deadline) Thread.sleep(5);
+
+                // Disconnect Generation 1 and Reconnect Generation 2
+                client.disconnect();
+                peer1.close();
+                client.connect("127.0.0.1", server.getLocalPort());
+                try (Socket peer2 = server.accept()) {
+                    UUID gen2 = client.connectionId().orElseThrow();
+                    assertNotEquals(gen1, gen2);
+                    UUID clientId2 = UUID.randomUUID();
+                    client.supplySession(gen2, new SessionView(clientId2, "alice", gen2));
+
+                    // Release old workers so queued old-generation sender read runs now
+                    releaseOldWorker.countDown();
+                    long waitIdle = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while ((controlledPool.activeThreadCount() > 0 || controlledPool.queueSize() > 0)
+                            && System.nanoTime() < waitIdle) Thread.sleep(5);
+
+                    // Inject stale ACK and ERROR frames referencing oldTid over peer2 wire
+                    sendWireFrame(peer2, new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(),
+                            UUID.randomUUID(), new MessageBody.Ack(MessageType.FILE_CHUNK, AckStatus.STORED, oldTid)));
+                    sendWireFrame(peer2, new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(),
+                            UUID.randomUUID(), new MessageBody.Error(ErrorCode.TRANSFER_FAILED, "stale error", oldTid)));
+
+                    // Start a fresh transfer on Generation 2
+                    Path source2 = createTestFile("gen2.bin", 512);
+                    registry.execute("/sendfile " + recipient + " \"" + source2.toString().replace('\\', '/') + "\"");
+
+                    // Peer2 must ONLY receive the new FILE_OFFER, never any old-generation chunk or cancel frame
+                    peer2.setSoTimeout(3000);
+                    java.io.DataInputStream dis2 = new java.io.DataInputStream(peer2.getInputStream());
+                    int len2 = dis2.readInt();
+                    OutboundFrame firstOnGen2 = CODEC.decodePayload(java.nio.ByteBuffer.wrap(dis2.readNBytes(len2)));
+                    assertInstanceOf(MessageEnvelope.class, firstOnGen2);
+                    MessageEnvelope offer2 = (MessageEnvelope) firstOnGen2;
+                    assertEquals(MessageType.FILE_OFFER, offer2.type());
+                    assertEquals("gen2.bin", ((MessageBody.FileOffer) offer2.body()).fileName());
+                }
+            } finally {
+                releaseOldWorker.countDown();
+                controlledPool.close();
+            }
+        }
+    }
+
+    @RepeatedTest(20)
+    void oldGenerationReceiverWriteFinalizationAndCleanupDoNotAffectNewGenerationFiles() throws Exception {
+        try (ServerSocket server = new ServerSocket(0); TcpClient client = new TcpClient()) {
+            CommandRegistry registry = new CommandRegistry();
+            CountDownLatch releaseOldWorkers = new CountDownLatch(1);
+            TransferWorkerPool controlledPool = new TransferWorkerPool(2, 32);
+
+            try (FileTransferClientAdapter adapter = new FileTransferClientAdapter(
+                    client, registry, (text, gen) -> outputLines.add(gen + ":" + text),
+                    downloadsDir, () -> client.session().map(s -> downloadsDir.resolve(s.clientId().toString())).orElse(null),
+                    controlledPool)) {
+
+                client.connect("127.0.0.1", server.getLocalPort());
+                Socket peer1 = server.accept();
+                UUID gen1 = client.connectionId().orElseThrow();
+                UUID clientId = UUID.randomUUID();
+                client.supplySession(gen1, new SessionView(clientId, "bob", gen1));
+
+                UUID oldTid = UUID.randomUUID();
+                byte[] oldData = "old-generation-payload".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                sendWireFrame(peer1, new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                        new MessageBody.FileOffered(oldTid, UUID.randomUUID(), "old.bin", oldData.length)));
+
+                long waitOffer = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                while (!adapter.transferService().isTransferActive() && System.nanoTime() < waitOffer) Thread.sleep(5);
+
+                registry.execute("/accept " + oldTid);
+                peer1.setSoTimeout(3000);
+                java.io.DataInputStream dis1 = new java.io.DataInputStream(peer1.getInputStream());
+                int acceptLen = dis1.readInt();
+                MessageEnvelope acceptEnv = (MessageEnvelope) CODEC.decodePayload(java.nio.ByteBuffer.wrap(dis1.readNBytes(acceptLen)));
+                assertEquals(MessageType.FILE_ACCEPT, acceptEnv.type());
+
+                // Occupy worker pool so chunk write and finalization are queued across disconnect
+                CountDownLatch occupied = new CountDownLatch(2);
+                for (int i = 0; i < 2; i++) {
+                    controlledPool.submit(() -> {
+                        occupied.countDown();
+                        try { releaseOldWorkers.await(5, TimeUnit.SECONDS); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    });
+                }
+                assertTrue(occupied.await(2, TimeUnit.SECONDS));
+
+                // Deliver old chunk and FILE_COMPLETE before disconnect
+                sendWireFrame(peer1, new FileChunk(UUID.randomUUID(), oldTid, 0, oldData));
+                sendWireFrame(peer1, new MessageEnvelope(1, MessageType.FILE_COMPLETE, UUID.randomUUID(), null,
+                        new MessageBody.FileComplete(oldTid, 1, TransferChecksum.computeDigestHex(oldData))));
+
+                long waitQueued = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                while (controlledPool.queueSize() < 1 && System.nanoTime() < waitQueued) Thread.sleep(5);
+
+                // Disconnect Gen 1 and connect Gen 2 with the same clientId directory
+                client.disconnect();
+                peer1.close();
+                client.connect("127.0.0.1", server.getLocalPort());
+                try (Socket peer2 = server.accept()) {
+                    UUID gen2 = client.connectionId().orElseThrow();
+                    client.supplySession(gen2, new SessionView(clientId, "bob", gen2));
+
+                    // Release old workers
+                    releaseOldWorkers.countDown();
+                    long waitIdle = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while ((controlledPool.activeThreadCount() > 0 || controlledPool.queueSize() > 0)
+                            && System.nanoTime() < waitIdle) Thread.sleep(5);
+
+                    // Inject stale binary frame for oldTid over peer2 wire
+                    sendWireFrame(peer2, new FileChunk(UUID.randomUUID(), oldTid, 0, oldData));
+
+                    // Now run a complete new-generation download on Gen 2
+                    UUID newTid = UUID.randomUUID();
+                    byte[] newData = "new-generation-verified-payload".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    String newSha = TransferChecksum.computeDigestHex(newData);
+
+                    sendWireFrame(peer2, new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                            new MessageBody.FileOffered(newTid, UUID.randomUUID(), "new.bin", newData.length)));
+                    long waitNewOffer = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while (!newTid.equals(adapter.transferService().activeTransferId().orElse(null))
+                            && System.nanoTime() < waitNewOffer) Thread.sleep(5);
+
+                    registry.execute("/accept " + newTid);
+                    peer2.setSoTimeout(3000);
+                    java.io.DataInputStream dis2 = new java.io.DataInputStream(peer2.getInputStream());
+                    int lenA = dis2.readInt();
+                    MessageEnvelope newAccept = (MessageEnvelope) CODEC.decodePayload(java.nio.ByteBuffer.wrap(dis2.readNBytes(lenA)));
+                    assertEquals(MessageType.FILE_ACCEPT, newAccept.type());
+                    assertEquals(newTid, ((MessageBody.TransferReference) newAccept.body()).transferId());
+
+                    sendWireFrame(peer2, new FileChunk(UUID.randomUUID(), newTid, 0, newData));
+                    sendWireFrame(peer2, new MessageEnvelope(1, MessageType.FILE_COMPLETE, UUID.randomUUID(), null,
+                            new MessageBody.FileComplete(newTid, 1, newSha)));
+
+                    int lenR = dis2.readInt();
+                    MessageEnvelope newReceived = (MessageEnvelope) CODEC.decodePayload(java.nio.ByteBuffer.wrap(dis2.readNBytes(lenR)));
+                    assertEquals(MessageType.FILE_RECEIVED, newReceived.type());
+                    assertEquals(newTid, ((MessageBody.FileReceived) newReceived.body()).transferId());
+
+                    sendWireFrame(peer2, new MessageEnvelope(1, MessageType.ACK, UUID.randomUUID(), newReceived.messageId(),
+                            new MessageBody.Ack(MessageType.FILE_RECEIVED, AckStatus.ACCEPTED, newTid)));
+
+                    long waitComplete = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while (adapter.transferService().isTransferActive() && System.nanoTime() < waitComplete) Thread.sleep(5);
+
+                    Path clientDir = downloadsDir.resolve(clientId.toString());
+                    assertFalse(Files.exists(clientDir.resolve(oldTid + ".bin")), "Old generation file must not be published");
+                    assertFalse(Files.exists(clientDir.resolve(oldTid + ".part")), "Old generation partial file must be cleaned up");
+                    assertTrue(Files.exists(clientDir.resolve(newTid + ".bin")), "New generation file must exist");
+                    assertArrayEquals(newData, Files.readAllBytes(clientDir.resolve(newTid + ".bin")));
+                }
+            } finally {
+                releaseOldWorkers.countDown();
+                controlledPool.close();
             }
         }
     }

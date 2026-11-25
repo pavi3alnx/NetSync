@@ -1,10 +1,12 @@
 package com.netsync.client;
 
 import com.netsync.chat.ChatClientAdapter;
+import com.netsync.transfer.FileTransferClientAdapter;
 import com.netsync.common.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.nio.file.Path;
 
 /** Minimal reusable CLI shell. Owns the supplied transport, but not input/output streams. */
 public final class NetSyncClient implements AutoCloseable {
@@ -15,6 +17,7 @@ public final class NetSyncClient implements AutoCloseable {
     private final ClientAuthenticationAdapter authentication;
     private final ClientPresenceAdapter presence;
     private final ChatClientAdapter chat;
+    private final FileTransferClientAdapter fileTransfer;
     private final int defaultUdpPort;
     private volatile boolean quit;
     public NetSyncClient(TcpClient transport, PrintWriter output) {
@@ -26,6 +29,11 @@ public final class NetSyncClient implements AutoCloseable {
     }
     public NetSyncClient(TcpClient transport, PrintWriter output,
                          ClientAuthenticationAdapter.PasswordInput passwords, int udpPort) {
+        this(transport, output, passwords, udpPort, Path.of(ProtocolLimits.STORAGE_ROOT, "clients"));
+    }
+    public NetSyncClient(TcpClient transport, PrintWriter output,
+                         ClientAuthenticationAdapter.PasswordInput passwords, int udpPort,
+                         Path clientsRoot) {
         this.transport = Objects.requireNonNull(transport);
         PrintWriter writer = Objects.requireNonNull(output);
         if (udpPort < 1 || udpPort > 65535) throw new IllegalArgumentException("Invalid presence UDP port");
@@ -74,15 +82,23 @@ public final class NetSyncClient implements AutoCloseable {
                     if (activeOnly) this.output.offerActiveImportant(text, generation);
                     else this.output.offerImportant(text, generation);
                 });
+        Objects.requireNonNull(clientsRoot);
+        fileTransfer = new FileTransferClientAdapter(transport, commands,
+                (text, generation) -> this.output.offerActiveImportant(text, generation),
+                clientsRoot,
+                () -> transport.session().map(session -> clientsRoot.resolve(session.clientId().toString())).orElse(null),
+                null);
     }
     public TcpClient transport() { return transport; }
     public CommandRegistry commands() { return commands; }
     public ClientAuthenticationAdapter authentication() { return authentication; }
     public ClientPresenceAdapter presence() { return presence; }
     public ChatClientAdapter chat() { return chat; }
+    public FileTransferClientAdapter fileTransfer() { return fileTransfer; }
     ClientOutputQueue outputQueueForTesting() { return output; }
     private void displayGenericMessage(MessageEnvelope message) {
         if (chat != null && chat.ownsResponse(message)) return;
+        if (fileTransfer != null && fileTransfer.ownsResponse(message)) return;
         output.offerActiveImportant("Received " + message.type() + " [" + message.messageId() + "]",
                 transport.connectionId().orElse(null));
     }
@@ -124,7 +140,7 @@ public final class NetSyncClient implements AutoCloseable {
     }
     private void print(String text) { output.offer(text); }
     @Override public void close() {
-        quit = true; chat.close(); presence.close(); authentication.close(); display.forEach(ClientDispatcher.Registration::close);
+        quit = true; fileTransfer.close(); chat.close(); presence.close(); authentication.close(); display.forEach(ClientDispatcher.Registration::close);
         transport.close(); output.close();
     }
     public static void main(String[] args) throws IOException {
