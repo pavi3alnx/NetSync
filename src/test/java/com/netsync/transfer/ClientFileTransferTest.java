@@ -24,6 +24,13 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 @Timeout(15)
 class ClientFileTransferTest {
+    private void awaitStorageDeleted(SafeFileStorage storage, UUID transferId) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (storage.exists(transferId) && System.nanoTime() < deadline) {
+            try { Thread.sleep(10); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        assertFalse(storage.exists(transferId));
+    }
 
     @TempDir
     Path tempDir;
@@ -400,7 +407,7 @@ class ClientFileTransferTest {
         FileTransferResult result = receiverFuture.get(3, TimeUnit.SECONDS);
         assertFalse(result.success());
         assertEquals(FileReceiver.ReceiverState.FAILED, receiver.state());
-        assertFalse(receiverStorage.exists(transferId)); // cleaned up
+        awaitStorageDeleted(receiverStorage, transferId); // cleaned up
     }
 
     @Test
@@ -444,7 +451,7 @@ class ClientFileTransferTest {
         assertEquals(FileSender.SenderState.CANCELLED, sender.state());
 
         // Partial file must be deleted on checksum failure
-        assertFalse(receiverStorage.exists(sender.transferId()));
+        awaitStorageDeleted(receiverStorage, sender.transferId());
     }
 
     @Test
@@ -466,7 +473,7 @@ class ClientFileTransferTest {
         assertEquals(FileReceiver.ReceiverState.CANCELLED, receiver.state());
 
         // Partial file must be deleted
-        assertFalse(receiverStorage.exists(sender.transferId()));
+        awaitStorageDeleted(receiverStorage, sender.transferId());
     }
 
     @Test

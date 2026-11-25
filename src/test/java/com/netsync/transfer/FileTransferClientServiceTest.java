@@ -425,6 +425,8 @@ class FileTransferClientServiceTest {
         );
         service.handleControl(offerEnv);
         service.acceptOffer(transferId);
+        OutboundFrame accepted = sink.takeFrame(3);
+        assertEquals(MessageType.FILE_ACCEPT, ((MessageEnvelope) accepted).type());
         sink.drainFrames();
 
         // Send a chunk for a completely different transfer ID (should be dropped without corrupting state)
@@ -458,14 +460,14 @@ class FileTransferClientServiceTest {
         );
         service.handleControl(offerEnv);
         service.acceptOffer(transferId);
-        sink.drainFrames();
+        assertEquals(MessageType.FILE_ACCEPT, ((MessageEnvelope) sink.takeFrame(3)).type());
 
         // Write first non-final chunk (must be exactly MAX_CHUNK_BYTES per protocol)
         FileChunk chunk = new FileChunk(UUID.randomUUID(), transferId, 0, new byte[ProtocolLimits.MAX_CHUNK_BYTES]);
         service.handleChunk(chunk);
 
         Path partialFile = client1Downloads.resolve(transferId + ".part");
-        assertTrue(Files.exists(partialFile), "Partial file must exist while transfer is in progress");
+        await(() -> Files.exists(partialFile));
 
         // User cancels active transfer
         service.cancelActiveTransfer();
@@ -475,7 +477,7 @@ class FileTransferClientServiceTest {
         assertEquals(MessageType.FILE_CANCEL, ((MessageEnvelope) cancelFrame).type());
 
         // Partial file must be deleted upon cancellation
-        assertFalse(Files.exists(partialFile), "Partial file must be deleted upon cancellation");
+        await(() -> !Files.exists(partialFile));
         assertFalse(service.isTransferActive());
     }
 
@@ -499,13 +501,13 @@ class FileTransferClientServiceTest {
         Path partialFile = client1Downloads.resolve(transferId + ".part");
         FileChunk chunk = new FileChunk(UUID.randomUUID(), transferId, 0, new byte[ProtocolLimits.MAX_CHUNK_BYTES]);
         service.handleChunk(chunk);
-        assertTrue(Files.exists(partialFile));
+        await(() -> Files.exists(partialFile));
 
         // TCP Disconnection triggers onDisconnect
         service.onDisconnect();
 
         assertFalse(service.isTransferActive());
-        assertFalse(Files.exists(partialFile), "Partial file must be deleted on disconnect");
+        await(() -> !Files.exists(partialFile));
     }
 
     @Test
@@ -849,8 +851,8 @@ class FileTransferClientServiceTest {
 
         // Break sink, then accept
         failSink.set(true);
-        RuntimeException ex = assertThrows(RuntimeException.class, () -> service.acceptOffer(transferId));
-        assertTrue(ex.getMessage().contains("Network pipe broken on accept"));
+        assertDoesNotThrow(() -> service.acceptOffer(transferId));
+        await(() -> !service.isTransferActive());
 
         // Service state must be cleaned up
         assertFalse(service.isTransferActive());
@@ -945,5 +947,149 @@ class FileTransferClientServiceTest {
         assertEquals(MessageType.FILE_REJECT, ((MessageEnvelope) rejectFrame).type());
         assertFalse(service.isTransferActive());
         assertEquals(1, listener.rejections.size());
+    }
+
+    @Test
+    void existingFinalDestinationIsPreservedWhenTransferFinalizationCollides() throws Exception {
+        CapturingSink sink = new CapturingSink();
+        FileTransferClientService service = new FileTransferClientService(sink, () -> client1Downloads, sharedWorkerPool);
+        UUID transferId = UUID.randomUUID();
+        byte[] payload = "replacement must not happen".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        Path destination = client1Downloads.resolve(transferId + ".bin");
+        byte[] sentinel = new byte[]{91, 92, 93, 94};
+        Files.write(destination, sentinel);
+        service.handleControl(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                new MessageBody.FileOffered(transferId, UUID.randomUUID(), "collision.bin", payload.length)));
+        service.acceptOffer(transferId);
+        assertEquals(MessageType.FILE_ACCEPT, ((MessageEnvelope) sink.takeFrame(3)).type());
+        service.handleChunk(new FileChunk(UUID.randomUUID(), transferId, 0, payload));
+        service.handleControl(new MessageEnvelope(1, MessageType.FILE_COMPLETE, UUID.randomUUID(), null,
+                new MessageBody.FileComplete(transferId, 1, TransferChecksum.computeDigestHex(payload))));
+
+        await(() -> service.receiverState().isEmpty());
+        assertArrayEquals(sentinel, Files.readAllBytes(destination));
+        await(() -> !Files.exists(client1Downloads.resolve(transferId + ".part")));
+    }
+
+    @Test
+    void blockedReceiverDiskWriteDoesNotBlockSerialControlCallbacks() throws Exception {
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        SafeFileStorage blockingStorage = new SafeFileStorage(client1Downloads) {
+            @Override public void appendChunk(UUID id, byte[] data, int offset, int length) throws IOException {
+                writeEntered.countDown();
+                try {
+                    if (!releaseWrite.await(5, TimeUnit.SECONDS)) throw new IOException("controlled write timed out");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt(); throw new IOException(interrupted);
+                }
+                super.appendChunk(id, data, offset, length);
+            }
+        };
+        CapturingSink sink = new CapturingSink();
+        FileReceiver receiver = new FileReceiver(sink, blockingStorage, sharedWorkerPool);
+        UUID transferId = UUID.randomUUID();
+        receiver.handleControl(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                new MessageBody.FileOffered(transferId, UUID.randomUUID(), "slow.bin", 100)));
+        receiver.accept(transferId);
+        assertEquals(MessageType.FILE_ACCEPT, ((MessageEnvelope) sink.takeFrame(3)).type());
+        receiver.handleChunk(new FileChunk(UUID.randomUUID(), transferId, 0, new byte[100]));
+        assertTrue(writeEntered.await(2, TimeUnit.SECONDS));
+
+        CompletableFuture<Void> nextControl = CompletableFuture.runAsync(() -> receiver.handleControl(
+                new MessageEnvelope(1, MessageType.ERROR, UUID.randomUUID(), null,
+                        new MessageBody.Error(ErrorCode.INVALID_REQUEST, "unrelated", null))));
+        assertDoesNotThrow(() -> nextControl.get(500, TimeUnit.MILLISECONDS),
+                "A blocked file write must not hold the serial control callback");
+        receiver.cancel();
+        releaseWrite.countDown();
+        receiver.cleanupCompletion().get(3, TimeUnit.SECONDS);
+        await(() -> !Files.exists(blockingStorage.resolvePartFile(transferId)));
+        receiver.close();
+    }
+
+    @Test
+    void clientWorkerSubmissionRejectionAndReceiverChunkQueueLimitEnforceBoundedBackpressure() throws Exception {
+        // 1. Client worker pool saturation during receiver accept / chunk write
+        TransferWorkerPool tinyPool = new TransferWorkerPool(1, 1);
+        CountDownLatch occupied = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            tinyPool.submit(() -> {
+                occupied.countDown();
+                try { release.await(5, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+            assertTrue(occupied.await(2, TimeUnit.SECONDS));
+
+            CapturingSink sink = new CapturingSink();
+            FileReceiver receiver = new FileReceiver(sink, new SafeFileStorage(client1Downloads), tinyPool);
+            UUID tid = UUID.randomUUID();
+            receiver.handleControl(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                    new MessageBody.FileOffered(tid, UUID.randomUUID(), "bounded.bin", ProtocolLimits.MAX_CHUNK_BYTES * 40L)));
+
+            // Accept uses the 1 remaining queue slot in tinyPool
+            CompletableFuture<FileTransferResult> future = receiver.accept(tid);
+
+            // Queue 32 chunks while writePending=false? Wait: first chunk sets writePending=true and submits to tinyPool, which rejects!
+            receiver.handleChunk(new FileChunk(UUID.randomUUID(), tid, 0, new byte[ProtocolLimits.MAX_CHUNK_BYTES]));
+            FileTransferResult res = future.get(3, TimeUnit.SECONDS);
+            assertFalse(res.success());
+            assertTrue(res.message().contains("worker capacity is unavailable"));
+            assertEquals(FileReceiver.ReceiverState.FAILED, receiver.state());
+        } finally {
+            release.countDown();
+            tinyPool.close();
+        }
+
+        // 2. Receiver pending chunk queue limit (MAX_QUEUED_CHUNKS = 32)
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        SafeFileStorage holdingStorage = new SafeFileStorage(client2Downloads) {
+            @Override public void appendChunk(UUID id, byte[] data, int offset, int length) throws IOException {
+                writeEntered.countDown();
+                try { releaseWrite.await(5, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                super.appendChunk(id, data, offset, length);
+            }
+        };
+        try {
+            CapturingSink sink2 = new CapturingSink();
+            FileReceiver receiver2 = new FileReceiver(sink2, holdingStorage, sharedWorkerPool);
+            UUID tid2 = UUID.randomUUID();
+            long totalSize = ProtocolLimits.MAX_CHUNK_BYTES * 40L;
+            receiver2.handleControl(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                    new MessageBody.FileOffered(tid2, UUID.randomUUID(), "queue_bound.bin", totalSize)));
+            CompletableFuture<FileTransferResult> future2 = receiver2.accept(tid2);
+            assertEquals(MessageType.FILE_ACCEPT, ((MessageEnvelope) sink2.takeFrame(3)).type());
+
+            // Chunk 0 enters worker and blocks in appendChunk (writePending = true)
+            receiver2.handleChunk(new FileChunk(UUID.randomUUID(), tid2, 0, new byte[ProtocolLimits.MAX_CHUNK_BYTES]));
+            assertTrue(writeEntered.await(2, TimeUnit.SECONDS));
+
+            // Chunks 1..32 fill the 32-element receiver queue
+            for (int seq = 1; seq <= 32; seq++) {
+                receiver2.handleChunk(new FileChunk(UUID.randomUUID(), tid2, seq, new byte[ProtocolLimits.MAX_CHUNK_BYTES]));
+            }
+            assertEquals(FileReceiver.ReceiverState.RECEIVING, receiver2.state());
+
+            // Chunk 33 exceeds MAX_QUEUED_CHUNKS (32) and deterministically fails the transfer
+            receiver2.handleChunk(new FileChunk(UUID.randomUUID(), tid2, 33, new byte[ProtocolLimits.MAX_CHUNK_BYTES]));
+            FileTransferResult res2 = future2.get(3, TimeUnit.SECONDS);
+            assertFalse(res2.success());
+            assertTrue(res2.message().contains("pending chunk limit reached"));
+            assertEquals(FileReceiver.ReceiverState.FAILED, receiver2.state());
+        } finally {
+            releaseWrite.countDown();
+        }
+    }
+
+    private static void await(java.util.function.BooleanSupplier condition) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            try { Thread.sleep(2); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); fail("Interrupted"); }
+        }
+        assertTrue(condition.getAsBoolean(), "Expected asynchronous file operation did not finish");
     }
 }

@@ -176,6 +176,86 @@ class ChatClientOutputPathTest {
         }
     }
 
+    @Test
+    void blockedOutputQueueAndExceptionsAndStaleGenerationsBehaveDeterministicallyForFileTransferOutput() throws Exception {
+        try (ControlledTcpPeer peer = new ControlledTcpPeer()) {
+            BlockingWriter writer = new BlockingWriter();
+            NetSyncClient cli = newClient(writer);
+            try {
+                ControlledTcpPeer.Connection first = connectLogin(cli, peer);
+                UUID firstGen = cli.transport().connectionId().orElseThrow();
+                assertTrue(writer.entered.await(2, TimeUnit.SECONDS));
+
+                // 1. While output worker is blocked, dispatch distinct transfer offers and terminal events + chat
+                UUID tid1 = UUID.randomUUID();
+                UUID tid2 = UUID.randomUUID();
+                CountDownLatch statusDispatched = new CountDownLatch(2);
+                cli.transport().dispatcher().register(MessageType.FILE_STATUS, ignored -> statusDispatched.countDown());
+
+                first.send(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                        new MessageBody.FileOffered(tid1, SENDER, "first_offer.bin", 128)));
+                first.send(new MessageEnvelope(1, MessageType.FILE_STATUS, UUID.randomUUID(), null,
+                        new MessageBody.FileStatus(tid1, FileStatusState.CANCELLED, "Sender cancelled first")));
+                first.send(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                        new MessageBody.FileOffered(tid2, SENDER, "second_offer.bin", 256)));
+                first.send(new MessageEnvelope(1, MessageType.FILE_STATUS, UUID.randomUUID(), null,
+                        new MessageBody.FileStatus(tid2, FileStatusState.FAILED, "Second timed out")));
+                first.deliver(SENDER, "chat alongside transfer events");
+
+                // Network dispatch must not block even while terminal output writer is blocked!
+                assertTrue(statusDispatched.await(2, TimeUnit.SECONDS),
+                        "Blocked terminal output must not block network dispatch of transfer events");
+                assertTrue(cli.outputQueueForTesting().pendingCount() <= ClientOutputQueue.DEFAULT_CAPACITY);
+
+                // Release output and verify distinct offers and terminal events are NOT coalesced
+                writer.release.countDown();
+                await(() -> writer.lines.stream().anyMatch(l -> l.contains("first_offer.bin"))
+                        && writer.lines.stream().anyMatch(l -> l.contains("Cancelled [" + tid1))
+                        && writer.lines.stream().anyMatch(l -> l.contains("second_offer.bin"))
+                        && writer.lines.stream().anyMatch(l -> l.contains("Failed [" + tid2))
+                        && writer.lines.stream().anyMatch(l -> l.contains("chat alongside transfer events")));
+
+                // Verify transfer ACK/ERROR ownership prevented generic shell duplicate output
+                assertFalse(writer.lines.stream().anyMatch(l -> l.startsWith("Received FILE_")));
+
+                // 2. Reconnect and verify stale-generation transfer output queued before disconnect is discarded
+                BlockingWriter writer2 = new BlockingWriter();
+                NetSyncClient cli2 = newClient(writer2);
+                try {
+                    ControlledTcpPeer.Connection connA = connectLogin(cli2, peer);
+                    assertTrue(writer2.entered.await(2, TimeUnit.SECONDS));
+                    UUID staleTid = UUID.randomUUID();
+                    CountDownLatch offerProcessed = new CountDownLatch(1);
+                    cli2.transport().dispatcher().register(MessageType.FILE_OFFERED, ignored -> offerProcessed.countDown());
+                    connA.send(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                            new MessageBody.FileOffered(staleTid, SENDER, "stale_gen_offer.bin", 100)));
+                    assertTrue(offerProcessed.await(2, TimeUnit.SECONDS));
+
+                    cli2.execute("/disconnect");
+                    cli2.execute("/connect 127.0.0.1 " + peer.port() + " 5051");
+                    ControlledTcpPeer.Connection connB = peer.nextConnection();
+                    cli2.execute("/login alice");
+                    await(() -> cli2.authentication().presenceCredentials().isPresent());
+                    assertNotEquals(firstGen, cli2.transport().connectionId().orElseThrow());
+
+                    writer2.release.countDown();
+                    UUID freshTid = UUID.randomUUID();
+                    connB.send(new MessageEnvelope(1, MessageType.FILE_OFFERED, UUID.randomUUID(), null,
+                            new MessageBody.FileOffered(freshTid, SENDER, "fresh_gen_offer.bin", 100)));
+                    await(() -> writer2.lines.stream().anyMatch(l -> l.contains("fresh_gen_offer.bin")));
+                    assertFalse(writer2.lines.stream().anyMatch(l -> l.contains("stale_gen_offer.bin")),
+                            "Stale-generation transfer output must be discarded after reconnect");
+                } finally {
+                    writer2.release.countDown();
+                    cli2.close();
+                }
+            } finally {
+                writer.release.countDown();
+                cli.close();
+            }
+        }
+    }
+
     private static NetSyncClient newClient(PrintWriter writer) {
         return new NetSyncClient(new TcpClient(), writer, () -> "disposable-alice".toCharArray(), 5051);
     }

@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -35,6 +36,14 @@ class FileTransferCoordinatorTest {
     private TransferTestFixtures.TestConnectionContext recipientContext;
     private SessionView senderSession;
     private SessionView recipientSession;
+
+    private void awaitStorageDeleted(UUID transferId) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (storage.exists(transferId) && System.nanoTime() < deadline) {
+            try { Thread.sleep(10); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        assertFalse(storage.exists(transferId));
+    }
 
     @BeforeEach
     void setUp() {
@@ -320,7 +329,7 @@ class FileTransferCoordinatorTest {
 
         // Registry entry removed and partial file deleted
         assertTrue(registry.get(transferId).isEmpty());
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
     }
 
     // =========================================================================
@@ -351,7 +360,7 @@ class FileTransferCoordinatorTest {
         assertEquals(FileStatusState.CANCELLED, ((MessageBody.FileStatus) recipientStatus.body()).state());
 
         // Storage and registry cleaned
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
         assertTrue(registry.get(transferId).isEmpty());
     }
 
@@ -425,7 +434,7 @@ class FileTransferCoordinatorTest {
 
         coordinator.onDisconnected(senderContext.connectionId());
 
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
         assertTrue(registry.get(transferId).isEmpty());
 
         // Recipient received FILE_STATUS(FAILED)
@@ -442,7 +451,7 @@ class FileTransferCoordinatorTest {
 
         coordinator.onDisconnected(recipientContext.connectionId());
 
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
         assertTrue(registry.get(transferId).isEmpty());
 
         // Sender received FILE_STATUS(FAILED)
@@ -463,7 +472,7 @@ class FileTransferCoordinatorTest {
         int expiredCount = coordinator.service().checkTimeouts();
         assertEquals(1, expiredCount);
 
-        assertFalse(storage.exists(transferId));
+        awaitStorageDeleted(transferId);
         assertTrue(registry.get(transferId).isEmpty());
 
         // Both parties notified with FILE_STATUS(FAILED)

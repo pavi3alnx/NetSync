@@ -27,6 +27,8 @@ public final class TransferSession {
     private int chunkCount;
     private long lastActivityEpochMs;
     private String verifiedSha256;
+    private boolean chunkWritePending;
+    private final Object storageLock = new Object();
 
     public TransferSession(
             UUID transferId,
@@ -81,6 +83,14 @@ public final class TransferSession {
     public long offerEpochMs() { return offerEpochMs; }
     public long lastActivityEpochMs() { return lastActivityEpochMs; }
     public String verifiedSha256() { return verifiedSha256; }
+    public boolean chunkWritePending() { return chunkWritePending; }
+
+    /** Selector-owned stop-and-wait reservation for the single outstanding chunk. */
+    public void setChunkWritePending(boolean pending) {
+        if (pending && chunkWritePending) throw new IllegalStateException("A chunk write is already pending");
+        chunkWritePending = pending;
+    }
+    Object storageLock() { return storageLock; }
 
     public void setVerifiedSha256(String sha256) {
         if (sha256 != null && !sha256.matches("[0-9a-f]{64}")) {

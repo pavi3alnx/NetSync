@@ -24,6 +24,8 @@ import java.util.function.Supplier;
  * </ul>
  */
 public final class FileTransferService {
+    static final int MAX_DEFERRED_CLEANUPS = 64;
+    static final int MAX_FAILED_CLEANUPS = 64;
 
     private final TransferRegistry registry;
     private final SafeFileStorage storage;
@@ -33,6 +35,10 @@ public final class FileTransferService {
     private final SessionRegistry sessionRegistry;
     private final AuthorizationService authorizationService;
     private final Supplier<Long> clock;
+    private final Object cleanupLock = new Object();
+    private final LinkedHashSet<UUID> deferredCleanups = new LinkedHashSet<>();
+    private final LinkedHashSet<UUID> failedCleanups = new LinkedHashSet<>();
+    private boolean cleanupDrainActive;
 
     public FileTransferService(
             TransferRegistry registry,
@@ -302,7 +308,7 @@ public final class FileTransferService {
         long now = clock.get();
         session.transitionTo(TransferState.REJECTED, now);
         registry.remove(transferId);
-        storage.deletePartialFile(transferId);
+        scheduleCleanup(session);
 
         // Notify sender via FILE_STATUS: REJECTED
         sendFileStatus(session.senderConnectionId(), transferId, FileStatusState.REJECTED, "Recipient rejected transfer offer", null);
@@ -342,6 +348,12 @@ public final class FileTransferService {
         }
         TransferSession session = sessionOpt.get();
 
+        if (!callerSession.connectionId().equals(session.senderConnectionId())) {
+            sendError(context.connectionId(), ErrorCode.FORBIDDEN,
+                    "File chunks must come from the connection that created the transfer", chunk.messageId(), transferId);
+            return;
+        }
+
         // Only designated sender can upload chunks
         if (!callerSession.clientId().equals(session.senderClientId())) {
             sendError(context.connectionId(), ErrorCode.FORBIDDEN, "Only the sender can upload file chunks", chunk.messageId(), transferId);
@@ -355,6 +367,14 @@ public final class FileTransferService {
         }
         if (session.state().isTerminal()) {
             sendError(context.connectionId(), ErrorCode.INVALID_STATE, "Cannot send chunks for terminated transfer: " + session.state(), chunk.messageId(), transferId);
+            return;
+        }
+
+        // Stop-and-wait means only one chunk may be undergoing disk work at a time.
+        // A repeated current sequence is rejected without scheduling a second append.
+        if (session.chunkWritePending()) {
+            sendError(context.connectionId(), ErrorCode.BUSY,
+                    "A chunk write is already pending for this transfer", chunk.messageId(), transferId);
             return;
         }
 
@@ -398,23 +418,46 @@ public final class FileTransferService {
             return;
         }
         SelectorTasks.Reservation reservation = reservationOpt.get();
+        session.setChunkWritePending(true);
 
         // Offload disk write to bounded worker pool
         try {
             workerPool.submit(() -> {
                 try {
-                    // Disk write on worker thread
-                    storage.appendChunk(transferId, chunkData);
+                    boolean current;
+                    boolean wrote = false;
+                    synchronized (session.storageLock()) {
+                        current = registry.get(transferId).orElse(null) == session
+                                && session.state().isActive() && session.chunkWritePending();
+                        if (current) {
+                            storage.appendChunk(transferId, chunkData);
+                            wrote = true;
+                        }
+                        if (wrote && (!registry.get(transferId).isPresent()
+                                || !session.state().isActive()
+                                || registry.get(transferId).orElse(null) != session)) {
+                            deletePartialWithBoundedRetry(transferId);
+                        }
+                    }
 
                     // Post completion back to Selector thread via reservation
-                    reservation.submit(() -> onChunkWriteCompleted(transferId, chunk));
+                    boolean wroteChunk = wrote;
+                    reservation.submit(() -> onChunkWriteCompleted(session, chunk, wroteChunk));
                 } catch (Throwable t) {
-                    reservation.close();
-                    selectorTasks.submit(() -> onChunkWriteFailed(transferId, chunk, t.getMessage()));
+                    try {
+                        reservation.submit(() -> onChunkWriteFailed(session, chunk, safeFailure(t)));
+                    } catch (IllegalStateException cancelledByShutdown) {
+                        // Selector shutdown owns terminal cleanup; the application closes
+                        // the worker pool and this worker owns the final partial-file removal.
+                        synchronized (session.storageLock()) { deletePartialWithBoundedRetry(transferId); }
+                    }
+                } finally {
+                    drainDeferredCleanupsOnWorker();
                 }
             });
         } catch (RejectedExecutionException e) {
             reservation.close();
+            session.setChunkWritePending(false);
             sendError(context.connectionId(), ErrorCode.BUSY, "Transfer worker pool saturated", chunk.messageId(), transferId);
         }
     }
@@ -422,13 +465,21 @@ public final class FileTransferService {
     /**
      * Executes on the Selector thread when chunk disk writing succeeds.
      */
-    private void onChunkWriteCompleted(UUID transferId, FileChunk chunk) {
+    private void onChunkWriteCompleted(TransferSession acceptedSession, FileChunk chunk, boolean wroteChunk) {
+        UUID transferId = acceptedSession.transferId();
         Optional<TransferSession> sessionOpt = registry.get(transferId);
-        if (sessionOpt.isEmpty() || !sessionOpt.get().state().isActive()) {
+        if (sessionOpt.isEmpty() || sessionOpt.get() != acceptedSession || !sessionOpt.get().state().isActive()
+                || !acceptedSession.chunkWritePending()
+                || acceptedSession.expectedSequence() != chunk.sequence()) {
             // Transfer was cancelled, failed, or disconnected while worker was running
+            if (acceptedSession.chunkWritePending()) acceptedSession.setChunkWritePending(false);
+            // Worker has already observed terminal ownership and removed the file.
+            // Keep cleanup idempotent for cancellation races that arrive after append.
+            if (wroteChunk) scheduleCleanup(acceptedSession);
             return;
         }
         TransferSession session = sessionOpt.get();
+        session.setChunkWritePending(false);
 
         long now = clock.get();
         session.validateAndRecordChunk(chunk.sequence(), chunk.data().length, now);
@@ -449,13 +500,168 @@ public final class FileTransferService {
     /**
      * Executes on the Selector thread when chunk disk writing fails.
      */
-    private void onChunkWriteFailed(UUID transferId, FileChunk chunk, String errorMessage) {
+    private void onChunkWriteFailed(TransferSession acceptedSession, FileChunk chunk, String errorMessage) {
+        UUID transferId = acceptedSession.transferId();
         Optional<TransferSession> sessionOpt = registry.get(transferId);
-        if (sessionOpt.isEmpty() || !sessionOpt.get().state().isActive()) {
+        if (sessionOpt.isEmpty() || sessionOpt.get() != acceptedSession || !sessionOpt.get().state().isActive()) {
+            if (acceptedSession.chunkWritePending()) acceptedSession.setChunkWritePending(false);
+            scheduleCleanup(acceptedSession);
             return;
         }
         TransferSession session = sessionOpt.get();
+        if (session.chunkWritePending()) session.setChunkWritePending(false);
         abortTransfer(session, ErrorCode.TRANSFER_FAILED, "Storage error writing chunk: " + errorMessage, chunk.messageId());
+    }
+
+    private static String safeFailure(Throwable failure) {
+        return failure == null || failure.getMessage() == null ? "I/O failure" : failure.getMessage();
+    }
+
+    private void scheduleCleanup(TransferSession session) {
+        if (session.chunkWritePending()) return;
+        UUID transferId = session.transferId();
+        try {
+            workerPool.submit(() -> {
+                try {
+                    synchronized (session.storageLock()) {
+                        // Recheck after acquiring storage ownership; a queued append may
+                        // have been accepted before the terminal transition.
+                        if (registry.get(transferId).orElse(null) != session || !session.state().isActive()) {
+                            deletePartialWithBoundedRetry(transferId);
+                        }
+                    }
+                } finally {
+                    drainDeferredCleanupsOnWorker();
+                }
+            });
+        } catch (RejectedExecutionException rejected) {
+            // Queue was saturated or pool is shutting down; retain transferId in bounded
+            // deferred cleanup set so the next available worker or checkTimeouts pass drains it.
+            enqueueDeferredCleanup(transferId);
+        }
+    }
+
+    private void cleanupWhenIdle(TransferSession session) {
+        // Always queue cleanup behind any accepted append on the session's storage
+        // lock. The worker rechecks registry/state while holding that same lock.
+        scheduleCleanup(session);
+    }
+
+    private void enqueueDeferredCleanup(UUID transferId) {
+        if (transferId == null) return;
+        synchronized (cleanupLock) {
+            if (deferredCleanups.contains(transferId)) return;
+            while (deferredCleanups.size() >= MAX_DEFERRED_CLEANUPS) {
+                Iterator<UUID> it = deferredCleanups.iterator();
+                UUID evicted = it.next();
+                it.remove();
+                recordFailedCleanupLocked(evicted);
+            }
+            deferredCleanups.add(transferId);
+        }
+    }
+
+    private void recordFailedCleanup(UUID transferId) {
+        if (transferId == null) return;
+        synchronized (cleanupLock) {
+            recordFailedCleanupLocked(transferId);
+        }
+    }
+
+    private void recordFailedCleanupLocked(UUID transferId) {
+        failedCleanups.remove(transferId);
+        while (failedCleanups.size() >= MAX_FAILED_CLEANUPS) {
+            Iterator<UUID> it = failedCleanups.iterator();
+            it.next();
+            it.remove();
+        }
+        failedCleanups.add(transferId);
+    }
+
+    private void clearCleanupTracking(UUID transferId) {
+        if (transferId == null) return;
+        synchronized (cleanupLock) {
+            deferredCleanups.remove(transferId);
+            failedCleanups.remove(transferId);
+        }
+    }
+
+    private boolean deletePartialWithBoundedRetry(UUID transferId) {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            if (!storage.exists(transferId)) {
+                clearCleanupTracking(transferId);
+                return true;
+            }
+            if (storage.deletePartialFile(transferId) || !storage.exists(transferId)) {
+                clearCleanupTracking(transferId);
+                return true;
+            }
+            if (attempt < 49) {
+                try {
+                    Thread.sleep(10L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        if (storage.exists(transferId)) {
+            recordFailedCleanup(transferId);
+            return false;
+        }
+        clearCleanupTracking(transferId);
+        return true;
+    }
+
+    private void drainDeferredCleanupsOnWorker() {
+        while (true) {
+            UUID next;
+            synchronized (cleanupLock) {
+                Iterator<UUID> it = deferredCleanups.iterator();
+                if (!it.hasNext()) {
+                    cleanupDrainActive = false;
+                    return;
+                }
+                next = it.next();
+                it.remove();
+            }
+            // Only delete if no active session currently owns this transferId
+            Optional<TransferSession> current = registry.get(next);
+            if (current.isEmpty() || !current.get().state().isActive()) {
+                deletePartialWithBoundedRetry(next);
+            }
+        }
+    }
+
+    private void triggerDeferredCleanupDrain() {
+        boolean shouldSubmit = false;
+        synchronized (cleanupLock) {
+            if (!deferredCleanups.isEmpty() && !cleanupDrainActive) {
+                cleanupDrainActive = true;
+                shouldSubmit = true;
+            }
+        }
+        if (shouldSubmit) {
+            try {
+                workerPool.submit(this::drainDeferredCleanupsOnWorker);
+            } catch (RejectedExecutionException rejected) {
+                synchronized (cleanupLock) {
+                    cleanupDrainActive = false;
+                }
+            }
+        }
+    }
+
+    public Set<UUID> pendingCleanupIds() {
+        synchronized (cleanupLock) {
+            return Set.copyOf(deferredCleanups);
+        }
+    }
+
+    public Set<UUID> failedCleanupIds() {
+        synchronized (cleanupLock) {
+            return Set.copyOf(failedCleanups);
+        }
     }
 
     // =========================================================================
@@ -534,8 +740,13 @@ public final class FileTransferService {
 
                     reservation.submit(() -> onChecksumComputed(transferId, message.messageId(), complete.sha256(), actualSha256, complete.chunkCount()));
                 } catch (Throwable t) {
-                    reservation.close();
-                    selectorTasks.submit(() -> onChecksumComputationFailed(transferId, message.messageId(), t.getMessage()));
+                    try {
+                        reservation.submit(() -> onChecksumComputationFailed(transferId, message.messageId(), safeFailure(t)));
+                    } catch (IllegalStateException cancelledByShutdown) {
+                        // Shutdown invokes disconnect cleanup and terminates the worker owner.
+                    }
+                } finally {
+                    drainDeferredCleanupsOnWorker();
                 }
             });
         } catch (RejectedExecutionException e) {
@@ -634,7 +845,7 @@ public final class FileTransferService {
         // Conclude transfer successfully
         long now = clock.get();
         session.transitionTo(TransferState.COMPLETED, now);
-        storage.deletePartialFile(transferId);
+        cleanupWhenIdle(session);
         registry.remove(transferId);
 
         // Acknowledge recipient
@@ -685,7 +896,7 @@ public final class FileTransferService {
 
         long now = clock.get();
         session.transitionTo(TransferState.CANCELLED, now);
-        storage.deletePartialFile(transferId);
+        cleanupWhenIdle(session);
         registry.remove(transferId);
 
         // Acknowledge caller
@@ -767,7 +978,7 @@ public final class FileTransferService {
                 session.transitionTo(TransferState.FAILED, now);
             } catch (Exception ignored) {}
 
-            storage.deletePartialFile(session.transferId());
+            cleanupWhenIdle(session);
             registry.remove(session.transferId());
 
             // Notify surviving peer
@@ -796,7 +1007,7 @@ public final class FileTransferService {
                 session.transitionTo(TransferState.FAILED, now);
             } catch (Exception ignored) {}
 
-            storage.deletePartialFile(session.transferId());
+            cleanupWhenIdle(session);
             registry.remove(session.transferId());
 
             sendFileStatus(session.senderConnectionId(), session.transferId(), FileStatusState.FAILED, "Transfer timed out", null);
@@ -804,6 +1015,7 @@ public final class FileTransferService {
                 sendFileStatus(session.recipientConnectionId(), session.transferId(), FileStatusState.FAILED, "Transfer timed out", null);
             }
         }
+        triggerDeferredCleanupDrain();
         return expired.size();
     }
 
@@ -820,7 +1032,7 @@ public final class FileTransferService {
             session.transitionTo(TransferState.FAILED, now);
         } catch (Exception ignored) {}
 
-        storage.deletePartialFile(session.transferId());
+        cleanupWhenIdle(session);
         registry.remove(session.transferId());
 
         if (replyToMessageId != null) {

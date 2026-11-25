@@ -15,7 +15,7 @@ import java.util.UUID;
  * generated names in the format {@code <transferId>.part}. User-supplied filenames
  * are never resolved against the filesystem to prevent directory traversal and link attacks.
  */
-public final class SafeFileStorage {
+public class SafeFileStorage {
     private final Path rootDir;
 
     public SafeFileStorage() {
@@ -32,10 +32,19 @@ public final class SafeFileStorage {
      */
     private void ensureRootDirectory() {
         try {
-            if (Files.exists(rootDir) && Files.isSymbolicLink(rootDir)) {
-                throw new SecurityException("Storage root must not be a symbolic link: " + rootDir);
+            Path current = rootDir.getRoot();
+            if (current == null) throw new SecurityException("Storage root must be absolute");
+            for (Path component : rootDir) {
+                current = current.resolve(component);
+                if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                    if (Files.isSymbolicLink(current))
+                        throw new SecurityException("Storage path contains a symbolic link: " + current);
+                    if (!Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS))
+                        throw new SecurityException("Storage path component is not a directory: " + current);
+                } else {
+                    Files.createDirectory(current);
+                }
             }
-            Files.createDirectories(rootDir);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to initialize storage directory: " + rootDir, e);
         }
@@ -52,8 +61,18 @@ public final class SafeFileStorage {
      * @return safe absolute Path under root directory
      */
     public Path resolvePartFile(UUID transferId) {
+        return resolveGeneratedFile(transferId, ".part");
+    }
+
+    /** Final generated client file path; an existing destination is never replaced. */
+    public Path resolveFinalFile(UUID transferId) {
+        return resolveGeneratedFile(transferId, ".bin");
+    }
+
+    private Path resolveGeneratedFile(UUID transferId, String suffix) {
+        ensureRootDirectory();
         Objects.requireNonNull(transferId, "Transfer ID must not be null");
-        String safeName = transferId + ".part";
+        String safeName = transferId + suffix;
         validateSafeFileName(safeName);
 
         Path candidate = rootDir.resolve(safeName).normalize().toAbsolutePath();
@@ -137,10 +156,25 @@ public final class SafeFileStorage {
         }
         try {
             Path partFile = resolvePartFile(transferId);
-            return Files.deleteIfExists(partFile);
-        } catch (IOException e) {
+            for (int attempt = 0; attempt < 10; attempt++) {
+                try {
+                    return Files.deleteIfExists(partFile);
+                } catch (IOException e) {
+                    if (attempt == 9) {
+                        return false;
+                    }
+                    try {
+                        Thread.sleep(1L);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
             return false;
         }
+        return false;
     }
 
     /**
