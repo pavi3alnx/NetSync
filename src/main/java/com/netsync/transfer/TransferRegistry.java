@@ -16,8 +16,8 @@ public final class TransferRegistry {
     private final int maxGlobalTransfers;
     private final int maxClientTransfers;
 
-    private final Map<UUID, TransferSession> activeTransfers = new HashMap<>();
-    private final Map<UUID, UUID> clientToTransfer = new HashMap<>();
+    private final Map<UUID, TransferSession> activeTransfers = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<UUID, UUID> clientToTransfer = new java.util.concurrent.ConcurrentHashMap<>();
 
     public TransferRegistry() {
         this(ProtocolLimits.MAX_TRANSFERS, ProtocolLimits.MAX_CLIENT_TRANSFERS);

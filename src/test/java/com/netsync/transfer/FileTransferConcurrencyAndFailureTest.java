@@ -475,6 +475,77 @@ class FileTransferConcurrencyAndFailureTest {
         return transferId;
     }
 
+    @RepeatedTest(20)
+    void deferredCleanupCapacityExhaustionRejectsNewOffersWithBusyWithoutEvictingPendingCleanups() throws Exception {
+        TransferWorkerPool tinyPool = new TransferWorkerPool(1, 1);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        FileTransferService satService = new FileTransferService(
+                registry, storage, tinyPool, outboundSink, selectorTasks, sessionRegistry, authService, clockTime::get);
+        FileTransferCoordinator satCoordinator = new FileTransferCoordinator(satService);
+
+        try {
+            // Saturate worker thread (1) and queue (1)
+            tinyPool.submit(() -> {
+                workerStarted.countDown();
+                try { releaseWorker.await(8, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+            assertTrue(workerStarted.await(2, TimeUnit.SECONDS));
+            tinyPool.submit(() -> {});
+
+            // Create and cancel MAX_DEFERRED_CLEANUPS (64) transfers while worker pool is saturated
+            java.util.List<UUID> expectedCleanups = new java.util.ArrayList<>();
+            for (int i = 0; i < FileTransferService.MAX_DEFERRED_CLEANUPS; i++) {
+                UUID tid = setupAcceptedTransferWith(satCoordinator, senderContext, recipientContext, "cap-" + i + ".bin", 32L);
+                storage.appendChunk(tid, new byte[32]);
+                assertTrue(storage.exists(tid));
+                expectedCleanups.add(tid);
+
+                satCoordinator.handleControl(senderContext, new MessageEnvelope(
+                        1, MessageType.FILE_CANCEL, UUID.randomUUID(), null, new MessageBody.TransferReference(tid)));
+                outboundSink.clear();
+            }
+
+            assertEquals(FileTransferService.MAX_DEFERRED_CLEANUPS, satService.pendingCleanupIds().size(),
+                    "All 64 deferred cleanup slots must be occupied");
+            assertTrue(satService.failedCleanupIds().isEmpty(),
+                    "No pending cleanup may be prematurely evicted into failedCleanups");
+
+            // 65th offer while deferredCleanups is at capacity must be rejected with ErrorCode.BUSY
+            UUID blockedOfferMsgId = UUID.randomUUID();
+            satCoordinator.handleControl(senderContext, new MessageEnvelope(
+                    1, MessageType.FILE_OFFER, blockedOfferMsgId, null,
+                    new MessageBody.FileOffer(recipientSession.clientId(), "overflow.bin", 32L)));
+            MessageEnvelope err = (MessageEnvelope) outboundSink.getAllFrames(senderContext.connectionId()).getFirst();
+            assertEquals(MessageType.ERROR, err.type());
+            assertEquals(blockedOfferMsgId, err.replyTo());
+            assertEquals(ErrorCode.BUSY, ((MessageBody.Error) err.body()).code());
+            assertEquals(0, registry.activeCount());
+            assertEquals(FileTransferService.MAX_DEFERRED_CLEANUPS, satService.pendingCleanupIds().size());
+            assertTrue(satService.failedCleanupIds().isEmpty());
+
+            // Release worker saturation and drain all 64 deferred cleanups
+            releaseWorker.countDown();
+            await(() -> tinyPool.queueSize() == 0 && tinyPool.activeThreadCount() == 0);
+            satService.checkTimeouts();
+            await(() -> satService.pendingCleanupIds().isEmpty());
+            assertTrue(satService.failedCleanupIds().isEmpty());
+            for (UUID tid : expectedCleanups) {
+                assertFalse(storage.exists(tid), "Deferred partial file must be deleted after recovery: " + tid);
+            }
+
+            // Now a new offer succeeds normally!
+            outboundSink.clear();
+            UUID recoveredTid = setupAcceptedTransferWith(satCoordinator, senderContext, recipientContext, "recovered.bin", 32L);
+            assertNotNull(recoveredTid);
+            assertEquals(1, registry.activeCount());
+        } finally {
+            releaseWorker.countDown();
+            tinyPool.close();
+        }
+    }
+
     // =========================================================================
     // Helpers
     // =========================================================================

@@ -283,15 +283,16 @@ class FileTransferProductionIntegrationTest {
                 // 2. Sender cancellation during active transfer
                 holdNextWrite.set(true);
                 alice.client.execute("/sendfile " + bobId + " \"" + source.toString().replace('\\', '/') + "\"");
-                await(() -> bob.client.fileTransfer().transferService().activeTransferId().isPresent());
+                await(() -> bob.client.fileTransfer().transferService().activeTransferId().isPresent()
+                        && alice.client.fileTransfer().transferService().activeTransferId().isPresent());
                 UUID senderCancelTid = bob.client.fileTransfer().transferService().activeTransferId().orElseThrow();
                 bob.client.execute("/accept " + senderCancelTid);
                 assertTrue(blockWrite.await(5, TimeUnit.SECONDS));
                 alice.client.execute("/cancel " + senderCancelTid);
+                await(() -> app.transferCoordinator().service().registry().activeCount() == 0);
                 releaseWrite.countDown();
                 await(() -> alice.text().contains("Cancelled transfer " + senderCancelTid)
                         && bob.text().contains("[Transfer] Cancelled [" + senderCancelTid)
-                        && app.transferCoordinator().service().registry().activeCount() == 0
                         && !serverStorage.exists(senderCancelTid));
                 assertFalse(Files.exists(bobRoot.resolve(bobId.toString()).resolve(senderCancelTid + ".bin")));
 
@@ -300,7 +301,8 @@ class FileTransferProductionIntegrationTest {
                 CountDownLatch releaseWrite2 = new CountDownLatch(1);
                 SafeFileStorage storageRef = serverStorage;
                 alice.client.execute("/sendfile " + bobId + " \"" + source.toString().replace('\\', '/') + "\"");
-                await(() -> bob.client.fileTransfer().transferService().activeTransferId().isPresent());
+                await(() -> bob.client.fileTransfer().transferService().activeTransferId().isPresent()
+                        && alice.client.fileTransfer().transferService().activeTransferId().isPresent());
                 UUID recipientCancelTid = bob.client.fileTransfer().transferService().activeTransferId().orElseThrow();
                 bob.client.execute("/cancel " + recipientCancelTid);
                 await(() -> bob.text().contains("Cancelled transfer " + recipientCancelTid)
@@ -310,7 +312,8 @@ class FileTransferProductionIntegrationTest {
 
                 // 4. Recipient disconnect during active transfer
                 alice.client.execute("/sendfile " + bobId + " \"" + source.toString().replace('\\', '/') + "\"");
-                await(() -> bob.client.fileTransfer().transferService().activeTransferId().isPresent());
+                await(() -> bob.client.fileTransfer().transferService().activeTransferId().isPresent()
+                        && alice.client.fileTransfer().transferService().activeTransferId().isPresent());
                 UUID recDiscTid = bob.client.fileTransfer().transferService().activeTransferId().orElseThrow();
                 bob.client.execute("/disconnect");
                 await(() -> alice.text().contains("[Transfer] Failed [" + recDiscTid)
@@ -644,7 +647,8 @@ class FileTransferProductionIntegrationTest {
 
                 bob.client.execute("/accept " + colTid);
                 await(() -> !bob.client.fileTransfer().transferService().isTransferActive()
-                        && !alice.client.fileTransfer().transferService().isTransferActive());
+                        && !alice.client.fileTransfer().transferService().isTransferActive()
+                        && !Files.exists(bobDownloads.resolve(bobId.toString()).resolve(colTid + ".part")));
                 assertArrayEquals(originalSentinel, Files.readAllBytes(preExisting),
                         "Existing destination file must never be overwritten on collision");
                 assertFalse(Files.exists(bobDownloads.resolve(bobId.toString()).resolve(colTid + ".part")),

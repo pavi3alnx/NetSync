@@ -43,9 +43,12 @@ class HeartbeatSenderTest {
                 Heartbeat second = receive(receiver);
                 long secondReceivedAt = System.nanoTime();
                 Heartbeat third = receive(receiver);
+                long thirdReceivedAt = System.nanoTime();
 
                 assertTrue(TimeUnit.NANOSECONDS.toMillis(firstReceivedAt - startedAt) < 1_000);
-                assertTrue(TimeUnit.NANOSECONDS.toMillis(secondReceivedAt - firstReceivedAt) >= 70);
+                assertTrue(TimeUnit.NANOSECONDS.toMillis(secondReceivedAt - startedAt) >= 70);
+                assertTrue(TimeUnit.NANOSECONDS.toMillis(thirdReceivedAt - firstReceivedAt) >= 140);
+                assertTrue(TimeUnit.NANOSECONDS.toMillis(thirdReceivedAt - startedAt) >= 180);
                 assertEquals(1, first.sequence());
                 assertEquals(2, second.sequence());
                 assertEquals(3, third.sequence());

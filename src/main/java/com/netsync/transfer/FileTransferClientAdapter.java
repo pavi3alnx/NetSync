@@ -38,6 +38,10 @@ public final class FileTransferClientAdapter implements Closeable {
     private final Set<UUID> activeGenerations = ConcurrentHashMap.newKeySet();
     private volatile UUID pendingSenderGeneration;
     private final Object lock = new Object();
+    private final CommandRegistry.Command sendFileCommand = this::executeSendFile;
+    private final CommandRegistry.Command acceptCommand = this::executeAccept;
+    private final CommandRegistry.Command rejectCommand = this::executeReject;
+    private final CommandRegistry.Command cancelCommand = this::executeCancel;
     private ClientDispatcher.Registration disconnectRegistration;
     private boolean closed;
 
@@ -412,10 +416,10 @@ public final class FileTransferClientAdapter implements Closeable {
     }
 
     private void registerCommands() {
-        commands.register("/sendfile", "/sendfile <recipientClientId> <filePath>", "Send a file to a recipient", this::executeSendFile);
-        commands.register("/accept", "/accept <transferId>", "Accept an incoming file offer", this::executeAccept);
-        commands.register("/reject", "/reject <transferId>", "Reject an incoming file offer", this::executeReject);
-        commands.register("/cancel", "/cancel [transferId]", "Cancel the active file transfer or a specific transfer", this::executeCancel);
+        commands.register("/sendfile", "/sendfile <recipientClientId> <filePath>", "Send a file to a recipient", sendFileCommand);
+        commands.register("/accept", "/accept <transferId>", "Accept an incoming file offer", acceptCommand);
+        commands.register("/reject", "/reject <transferId>", "Reject an incoming file offer", rejectCommand);
+        commands.register("/cancel", "/cancel [transferId]", "Cancel the active file transfer or a specific transfer", cancelCommand);
     }
 
     private void executeSendFile(List<String> args) {
@@ -697,6 +701,10 @@ public final class FileTransferClientAdapter implements Closeable {
             }
         }
         registrations.clear();
+        commands.unregister("/sendfile", sendFileCommand);
+        commands.unregister("/accept", acceptCommand);
+        commands.unregister("/reject", rejectCommand);
+        commands.unregister("/cancel", cancelCommand);
 
         service.close();
     }

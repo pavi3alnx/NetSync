@@ -302,4 +302,42 @@ class TcpClientTest {
         }
     }
 
+    @Test void reconnectWaitBehaviorWhenPreviousGenerationDispatchCallbackIsBlocked() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        try (ServerSocket server = new ServerSocket(0); TcpClient client = new TcpClient()) {
+            client.dispatcher().register(MessageType.PRESENCE_QUERY, m -> {
+                entered.countDown();
+                try { release.await(3, TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            });
+            // 1. Orderly remote EOF while dispatch callback is blocked: connect() refuses until old EOF drain finishes
+            client.connect("127.0.0.1", server.getLocalPort());
+            try (Socket peer1 = server.accept()) {
+                peer1.getOutputStream().write(encode(message()));
+                assertTrue(entered.await(3, TimeUnit.SECONDS));
+                peer1.shutdownOutput();
+                await(() -> !client.isConnected());
+                assertEquals(TcpClient.Failure.REMOTE_CLOSED, client.failure());
+                IllegalStateException stopping = assertThrows(IllegalStateException.class,
+                        () -> client.connect("127.0.0.1", server.getLocalPort()));
+                assertTrue(stopping.getMessage().contains("Previous connection is still stopping"));
+                release.countDown();
+                await(() -> {
+                    if (client.isConnected()) return true;
+                    try {
+                        client.connect("127.0.0.1", server.getLocalPort());
+                        return true;
+                    } catch (IllegalStateException busy) {
+                        return false;
+                    }
+                });
+                try (Socket peer2 = server.accept()) {
+                    assertTrue(client.isConnected());
+                }
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
 }
