@@ -163,7 +163,12 @@ public final class FileTransferService {
         }
         SessionView recipientSession = recipientSessionOpt.get();
 
-        // Enforce transfer concurrency limits
+        // Enforce transfer concurrency limits and deferred cleanup backlog limit
+        if (isDeferredCleanupExhausted()) {
+            triggerDeferredCleanupDrain();
+            sendError(context.connectionId(), ErrorCode.BUSY, "Server deferred transfer cleanup capacity reached", message.messageId(), null);
+            return;
+        }
         if (registry.activeCount() >= ProtocolLimits.MAX_TRANSFERS) {
             sendError(context.connectionId(), ErrorCode.BUSY, "Server active transfer capacity reached", message.messageId(), null);
             return;
@@ -444,6 +449,9 @@ public final class FileTransferService {
                     boolean wroteChunk = wrote;
                     reservation.submit(() -> onChunkWriteCompleted(session, chunk, wroteChunk));
                 } catch (Throwable t) {
+                    if (registry.get(transferId).orElse(null) != session || !session.state().isActive()) {
+                        synchronized (session.storageLock()) { deletePartialWithBoundedRetry(transferId); }
+                    }
                     try {
                         reservation.submit(() -> onChunkWriteFailed(session, chunk, safeFailure(t)));
                     } catch (IllegalStateException cancelledByShutdown) {
@@ -547,15 +555,17 @@ public final class FileTransferService {
         scheduleCleanup(session);
     }
 
+    private boolean isDeferredCleanupExhausted() {
+        synchronized (cleanupLock) {
+            return deferredCleanups.size() + registry.activeCount() >= MAX_DEFERRED_CLEANUPS;
+        }
+    }
+
     private void enqueueDeferredCleanup(UUID transferId) {
         if (transferId == null) return;
         synchronized (cleanupLock) {
-            if (deferredCleanups.contains(transferId)) return;
-            while (deferredCleanups.size() >= MAX_DEFERRED_CLEANUPS) {
-                Iterator<UUID> it = deferredCleanups.iterator();
-                UUID evicted = it.next();
-                it.remove();
-                recordFailedCleanupLocked(evicted);
+            if (deferredCleanups.contains(transferId) || deferredCleanups.size() >= MAX_DEFERRED_CLEANUPS) {
+                return;
             }
             deferredCleanups.add(transferId);
         }

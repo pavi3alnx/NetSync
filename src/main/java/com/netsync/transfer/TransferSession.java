@@ -21,13 +21,13 @@ public final class TransferSession {
     private final long offerEpochMs;
 
     private UUID recipientConnectionId;
-    private TransferState state;
+    private volatile TransferState state;
     private int expectedSequence;
     private long receivedBytes;
     private int chunkCount;
     private long lastActivityEpochMs;
     private String verifiedSha256;
-    private boolean chunkWritePending;
+    private volatile boolean chunkWritePending;
     private final Object storageLock = new Object();
 
     public TransferSession(

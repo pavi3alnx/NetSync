@@ -620,4 +620,63 @@ class NioServerTest {
             }
         }
     }
+
+    @Test void partialKernelWritesUnderSmallSocketBuffersDrainCompleteFramesInOrder() throws Exception {
+        var owner = new AtomicReference<NioServer>();
+        var states = new LinkedBlockingQueue<ConnectionState>();
+        byte[] payload = new byte[ProtocolLimits.MAX_CHUNK_BYTES];
+        for (int i = 0; i < payload.length; i++) payload[i] = (byte) (i * 19 + 5);
+        int chunkCount = 32; // > 512 KiB total, exceeding 256 KiB write budget (BYTE_BUDGET) and small socket buffer
+        try (NioServer server = new NioServer(0, (context, request) -> {
+            ConnectionState state = (ConnectionState) context;
+            try {
+                ((java.nio.channels.SocketChannel) state.key.channel())
+                        .setOption(java.net.StandardSocketOptions.SO_SNDBUF, 4096);
+            } catch (IOException ignored) { }
+            boolean allAccepted = true;
+            UUID tid = UUID.randomUUID();
+            for (int i = 0; i < chunkCount; i++) {
+                allAccepted &= owner.get().send(context.connectionId(),
+                        new FileChunk(UUID.randomUUID(), tid, i, payload)) == EnqueueResult.ACCEPTED;
+            }
+            if (allAccepted) states.add(state);
+        }, (context, chunk) -> {})) {
+            owner.set(server);
+            server.start();
+            try (Socket client = new Socket()) {
+                client.setReceiveBufferSize(4096);
+                client.connect(new InetSocketAddress("127.0.0.1", server.port()), 2000);
+                client.setSoTimeout(5000);
+                client.getOutputStream().write(encode(message()));
+                ConnectionState state = states.poll(3, TimeUnit.SECONDS);
+                assertNotNull(state);
+                // Wait until the first OP_WRITE pass has drained at least one byte from state.output,
+                // then observe on the selector thread that remaining bytes (> 256 KiB BYTE_BUDGET / 4 KiB SO_SNDBUF)
+                // are still buffered across subsequent OP_WRITE passes before the client starts reading.
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                int totalEnqueued = chunkCount * (ProtocolLimits.MAX_CHUNK_BYTES + 41);
+                boolean observedMidDrain = false;
+                while (System.nanoTime() < deadline && !observedMidDrain) {
+                    var check = new LinkedBlockingQueue<Boolean>();
+                    server.selectorTasks().submit(() -> {
+                        ByteBuffer head = state.output.peek();
+                        check.add(state.queuedBytes > 0 && state.queuedBytes < totalEnqueued
+                                && head != null && (head.position() > 0 || state.output.size() < chunkCount));
+                    });
+                    observedMidDrain = Boolean.TRUE.equals(check.poll(1, TimeUnit.SECONDS));
+                    if (!observedMidDrain) Thread.sleep(2);
+                }
+                assertTrue(observedMidDrain, "Must observe mid-drain partial/deferred write state across OP_WRITE passes");
+                for (int i = 0; i < chunkCount; i++) {
+                    FileChunk received = assertInstanceOf(FileChunk.class, readFrame(client));
+                    assertEquals(i, received.sequence());
+                    assertArrayEquals(payload, received.data());
+                }
+                var drained = new LinkedBlockingQueue<Boolean>();
+                server.selectorTasks().submit(() -> drained.add(state.queuedBytes == 0 && state.output.isEmpty()));
+                assertEquals(Boolean.TRUE, drained.poll(3, TimeUnit.SECONDS));
+                assertNull(server.failure());
+            }
+        }
+    }
 }

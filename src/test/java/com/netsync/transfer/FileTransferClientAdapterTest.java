@@ -477,6 +477,7 @@ class FileTransferClientAdapterTest {
 
             // Idempotent close
             assertDoesNotThrow(adapter::close);
+            assertTrue(registry.descriptions().isEmpty(), "Closed adapter must unregister its CLI commands");
         }
     }
 
