@@ -66,10 +66,9 @@ class GuiClientProductionIntegrationTest {
             }
             assertEquals(ClientModels.ConnectionPhase.DISCONNECTED, alice.phase());
 
-            // 2. Authenticate all three clients
-            SessionView aliceSession = alice.connectAndLogin(
-                    ProtocolLimits.BIND_ADDRESS, tcpPort, udpPort, "alice", "alice-demo-pw".toCharArray())
-                    .get(15, TimeUnit.SECONDS);
+            // 2. Authenticate all three clients (wait for prior failed login's transport threads to stop)
+            SessionView aliceSession = connectWhenReady(
+                    alice, ProtocolLimits.BIND_ADDRESS, tcpPort, udpPort, "alice", "alice-demo-pw");
             SessionView bobSession = bob.connectAndLogin(
                     ProtocolLimits.BIND_ADDRESS, tcpPort, udpPort, "bob", "bob-demo-pw".toCharArray())
                     .get(15, TimeUnit.SECONDS);
@@ -196,7 +195,7 @@ class GuiClientProductionIntegrationTest {
             assertTrue(alice.transfersSnapshot().isEmpty(),
                     "Transfer history must be cleared on logout");
 
-            SessionView aliceSession2 = reconnectAfterLogout(
+            SessionView aliceSession2 = connectWhenReady(
                     alice, ProtocolLimits.BIND_ADDRESS, tcpPort, udpPort, "alice", "alice-demo-pw");
             assertNotEquals(aliceSession.clientId(), aliceSession2.clientId(),
                     "Reconnected session must receive a new client ID");
@@ -278,7 +277,7 @@ class GuiClientProductionIntegrationTest {
         }
     }
 
-    private static SessionView reconnectAfterLogout(
+    private static SessionView connectWhenReady(
             ClientSessionController client, String host, int tcpPort, int udpPort, String user, String pass)
             throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
