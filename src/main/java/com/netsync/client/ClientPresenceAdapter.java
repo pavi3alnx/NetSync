@@ -9,11 +9,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Owns heartbeat resources off-dispatch; no presence tokens are rendered. */
 public final class ClientPresenceAdapter implements AutoCloseable {
+    /** Structured presence events for GUI and programmatic integration. */
+    public sealed interface PresenceEvent {
+        UUID connectionId();
+        record SnapshotReceived(UUID connectionId, List<MessageBody.PresenceEntry> entries) implements PresenceEvent {}
+        record UserUpdated(UUID connectionId, MessageBody.PresenceEntry entry) implements PresenceEvent {}
+        record QueryFailed(UUID connectionId, ErrorCode code) implements PresenceEvent {}
+        record HeartbeatStartFailed(UUID connectionId, String reason) implements PresenceEvent {}
+    }
+
     private final TcpClient client;
     private final ClientAuthenticationAdapter authentication;
     private final CommandRegistry commands;
     private final ClientOutputQueue output;
     private final List<ClientDispatcher.Registration> registrations = new ArrayList<>();
+    private final Set<java.util.function.Consumer<PresenceEvent>> eventListeners = new LinkedHashSet<>();
     private final CommandRegistry.Command queryCommand = args -> {
         if (!args.isEmpty()) throw new CommandRegistry.InputException("Usage: /presence");
         query();
@@ -28,10 +38,16 @@ public final class ClientPresenceAdapter implements AutoCloseable {
     private UUID queryId, queryConnection;
     private long queryStarted;
 
+    /** Public constructor for GUI and programmatic integration without a CLI output queue. */
+    public ClientPresenceAdapter(TcpClient client, ClientAuthenticationAdapter authentication,
+                                 CommandRegistry commands, int udpPort) {
+        this(client, authentication, commands, null, udpPort);
+    }
+
     ClientPresenceAdapter(TcpClient client, ClientAuthenticationAdapter authentication,
                           CommandRegistry commands, ClientOutputQueue output, int udpPort) {
         this.client = Objects.requireNonNull(client); this.authentication = Objects.requireNonNull(authentication);
-        this.commands = Objects.requireNonNull(commands); this.output = Objects.requireNonNull(output);
+        this.commands = Objects.requireNonNull(commands); this.output = output;
         setUdpPort(udpPort);
         lifecycle = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1), task -> {
             Thread thread = new Thread(() -> {
@@ -83,7 +99,23 @@ public final class ClientPresenceAdapter implements AutoCloseable {
                     () -> !closed.get() && authentication.isCurrent(captured) && !authentication.isLoggingOut());
             if (!closed.get() && authentication.isCurrent(captured) && !authentication.isLoggingOut()) sender.start();
         } catch (Exception failure) {
-            output.offerImportant("Presence heartbeat could not start; reconnect to retry.", current.session().connectionId());
+            if (output != null) output.offerImportant("Presence heartbeat could not start; reconnect to retry.", current.session().connectionId());
+            publishEvent(new PresenceEvent.HeartbeatStartFailed(current.session().connectionId(),
+                    "Presence heartbeat could not start; reconnect to retry."));
+        }
+    }
+
+    public ClientDispatcher.Registration onPresenceEvent(java.util.function.Consumer<PresenceEvent> listener) {
+        Objects.requireNonNull(listener);
+        synchronized (client) { eventListeners.add(listener); }
+        return () -> { synchronized (client) { eventListeners.remove(listener); } };
+    }
+
+    private void publishEvent(PresenceEvent event) {
+        List<java.util.function.Consumer<PresenceEvent>> snapshot;
+        synchronized (client) { snapshot = List.copyOf(eventListeners); }
+        for (java.util.function.Consumer<PresenceEvent> listener : snapshot) {
+            try { listener.accept(event); } catch (RuntimeException ignored) { }
         }
     }
 
@@ -109,44 +141,53 @@ public final class ClientPresenceAdapter implements AutoCloseable {
     private boolean authenticated() { return !closed.get() && authentication.presenceCredentials().isPresent(); }
     private void snapshot(MessageEnvelope message) {
         List<String> lines = new ArrayList<>();
+        List<MessageBody.PresenceEntry> entries;
         UUID connection;
         synchronized (client) {
             if (!authenticated() || queryId == null || !queryId.equals(message.replyTo())
                     || client.connectionId().filter(queryConnection::equals).isEmpty()
                     || !(message.body() instanceof MessageBody.PresenceSnapshot snapshot)) return;
             connection = queryConnection; queryId = queryConnection = null;
+            entries = snapshot.clients();
             lines.add("Presence snapshot:");
-            snapshot.clients().forEach(entry -> lines.add(entry.username() + " [" + entry.clientId() + "]: " + entry.state()));
-            if (snapshot.clients().isEmpty()) lines.add("No active users.");
+            entries.forEach(entry -> lines.add(entry.username() + " [" + entry.clientId() + "]: " + entry.state()));
+            if (entries.isEmpty()) lines.add("No active users.");
         }
-        if (client.connectionId().filter(connection::equals).isPresent())
-            lines.forEach(line -> output.offerImportant(line, connection));
+        if (client.connectionId().filter(connection::equals).isPresent()) {
+            if (output != null) lines.forEach(line -> output.offerImportant(line, connection));
+            publishEvent(new PresenceEvent.SnapshotReceived(connection, entries));
+        }
     }
     private void update(MessageEnvelope message) {
-        String text; UUID generation, clientId;
+        String text; UUID generation, clientId; MessageBody.PresenceEntry entry;
         synchronized (client) {
             if (!authenticated() || !(message.body() instanceof MessageBody.PresenceUpdate update)) return;
             generation = client.connectionId().orElse(null);
             if (generation == null) return;
             clientId = update.clientId();
+            entry = new MessageBody.PresenceEntry(update.clientId(), update.username(), update.state());
             text = "Presence: " + update.username() + " [" + update.clientId() + "] is " + update.state() + ".";
         }
-        output.offerPresence(generation, clientId, text);
+        if (output != null) output.offerPresence(generation, clientId, text);
+        publishEvent(new PresenceEvent.UserUpdated(generation, entry));
     }
     private void error(MessageEnvelope message) {
-        String text; UUID generation;
+        String text; UUID generation; ErrorCode code;
         synchronized (client) {
             if (closed.get() || queryId == null || !queryId.equals(message.replyTo())
                     || client.connectionId().filter(queryConnection::equals).isEmpty()
                     || !(message.body() instanceof MessageBody.Error error)) return;
             generation = queryConnection;
-            queryId = queryConnection = null; text = "Presence query failed (" + error.code() + ").";
+            code = error.code();
+            queryId = queryConnection = null; text = "Presence query failed (" + code + ").";
         }
-        output.offerImportant(text, generation);
+        if (output != null) output.offerImportant(text, generation);
+        publishEvent(new PresenceEvent.QueryFailed(generation, code));
     }
 
     @Override public void close() {
         if (!closed.compareAndSet(false, true)) return;
+        synchronized (client) { eventListeners.clear(); }
         registrations.forEach(ClientDispatcher.Registration::close);
         commands.unregister("/presence", queryCommand);
         synchronized (client) { queryId = queryConnection = null; }

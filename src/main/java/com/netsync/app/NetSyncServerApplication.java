@@ -191,6 +191,18 @@ public final class NetSyncServerApplication implements AutoCloseable {
     public synchronized IOException failure() { return server == null ? null : server.failure(); }
     /** The one authoritative registry, exposed through its read-only shared contract. */
     public SessionRegistry sessions() { return sessions; }
+    /** Thread-safe read-only presence lookup for server monitoring; empty if not started or unknown. */
+    public synchronized java.util.Optional<PresenceState> presenceState(UUID clientId) {
+        return presence == null || clientId == null ? java.util.Optional.empty() : presence.getPresenceState(clientId);
+    }
+    /** Thread-safe read-only active transfer count for server monitoring. */
+    public synchronized int activeTransferCount() {
+        return transferCoordinator == null ? 0 : transferCoordinator.service().registry().activeCount();
+    }
+    /** Returns the configured demo account count. */
+    public int configuredAccountCount() { return config.users().size(); }
+    /** Returns the fixed local demonstration security warning banner. */
+    public static String demoWarning() { return WARNING; }
     FileTransferCoordinator transferCoordinator() { return transferCoordinator; }
     SafeFileStorage transferStorage() { return transferStorage; }
     AuthService authentication() { return authentication; }

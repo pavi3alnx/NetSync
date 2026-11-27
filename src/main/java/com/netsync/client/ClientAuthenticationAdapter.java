@@ -34,6 +34,18 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         @Override public String toString() { return "PresenceCredentials[presenceToken=REDACTED]"; }
     }
 
+    /** Structured lifecycle events for GUI and programmatic integration (never exposes secrets). */
+    public sealed interface AuthEvent {
+        UUID connectionId();
+        record LoginSucceeded(UUID connectionId, SessionView session,
+                              int heartbeatIntervalSeconds, int presenceTimeoutSeconds) implements AuthEvent {}
+        record LoginFailed(UUID connectionId, ErrorCode code, String message) implements AuthEvent {}
+        record LoginTimedOut(UUID connectionId, String message) implements AuthEvent {}
+        record LogoutSucceeded(UUID connectionId) implements AuthEvent {}
+        record LogoutFailed(UUID connectionId, ErrorCode code, String message) implements AuthEvent {}
+        record Disconnected(UUID connectionId, TcpClient.Failure reason) implements AuthEvent {}
+    }
+
     private static final class Pending {
         final UUID id = UUID.randomUUID();
         final UUID connection;
@@ -63,13 +75,27 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
     private PresenceCredentials credentials;
     private boolean closed;
     private final Set<Runnable> stateListeners = new LinkedHashSet<>();
+    private final Set<Consumer<AuthEvent>> eventListeners = new LinkedHashSet<>();
 
     /** Internal composition notifications only enqueue bounded work; never perform I/O here. */
     public ClientDispatcher.Registration onStateChanged(Runnable signal) {
         synchronized (client) { stateListeners.add(signal); }
         return () -> { synchronized (client) { stateListeners.remove(signal); } };
     }
+    /** Registers a structured authentication event listener for GUI or programmatic callers. */
+    public ClientDispatcher.Registration onAuthEvent(Consumer<AuthEvent> listener) {
+        Objects.requireNonNull(listener);
+        synchronized (client) { eventListeners.add(listener); }
+        return () -> { synchronized (client) { eventListeners.remove(listener); } };
+    }
     private void stateChanged() { for (Runnable signal : List.copyOf(stateListeners)) signal.run(); }
+    private void publishEvent(AuthEvent event) {
+        List<Consumer<AuthEvent>> snapshot;
+        synchronized (client) { snapshot = List.copyOf(eventListeners); }
+        for (Consumer<AuthEvent> listener : snapshot) {
+            try { listener.accept(event); } catch (RuntimeException ignored) { }
+        }
+    }
     public boolean isLoggingOut() {
         synchronized (client) { return pending != null && pending.operation == MessageType.LOGOUT_REQUEST; }
     }
@@ -129,6 +155,24 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
     }
 
     public void login(String username) {
+        loginWithSupplier(username, passwords::readPassword, true);
+    }
+
+    /**
+     * Programmatic login for GUI or non-console callers. Takes ownership of the supplied password
+     * buffer and zeroes it in a finally block regardless of outcome.
+     */
+    public void login(String username, char[] password) {
+        char[] owned = password == null ? null : Arrays.copyOf(password, password.length);
+        if (password != null) Arrays.fill(password, '\0');
+        try {
+            loginWithSupplier(username, () -> owned, false);
+        } finally {
+            if (owned != null) Arrays.fill(owned, '\0');
+        }
+    }
+
+    private void loginWithSupplier(String username, java.util.function.Supplier<char[]> passwordSupplier, boolean fromConsole) {
         if (client.isDispatchThread()) throw new CommandRegistry.InputException("Run /login from the terminal thread.");
         if (username == null || !username.matches("[A-Za-z0-9_]{1,32}"))
             throw new CommandRegistry.InputException("Username must contain 1-32 ASCII letters, digits or underscores.");
@@ -142,9 +186,11 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         }
         char[] password = null;
         try {
-            try { password = passwords.readPassword(); }
+            try { password = passwordSupplier.get(); }
             catch (Exception failure) {
-                throw new CommandRegistry.InputException("Secure password input failed; use an interactive terminal with hidden input.");
+                throw new CommandRegistry.InputException(fromConsole
+                        ? "Secure password input failed; use an interactive terminal with hidden input."
+                        : "Password input failed.");
             }
             if (password == null) throw new CommandRegistry.InputException("Login cancelled.");
             if (password.length == 0 || password.length > 128)
@@ -206,6 +252,9 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         if (pending != null && pending.connection.equals(connection)
                 && (reason != TcpClient.Failure.REMOTE_CLOSED || !pending.sent)) pending = null;
         stateChanged();
+        for (Consumer<AuthEvent> listener : List.copyOf(eventListeners)) {
+            try { listener.accept(new AuthEvent.Disconnected(connection, reason)); } catch (RuntimeException ignored) { }
+        }
     }
 
     /** Returns only current credentials; disconnect/reconnect/close immediately makes access empty. */
@@ -228,15 +277,19 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         UUID disconnect = null;
         String notice;
         Pending operation;
+        AuthEvent event;
         synchronized (client) {
             operation = matching(message);
             if (operation == null || operation.operation != MessageType.LOGIN_REQUEST
                     || !(message.body() instanceof MessageBody.LoginResponse response)) return;
             pending = null;
-            if (!current(operation.connection)) notice = "Login did not complete: connection closed.";
-            else if (!operation.username.equals(response.username())) {
+            if (!current(operation.connection)) {
+                notice = "Login did not complete: connection closed.";
+                event = new AuthEvent.LoginFailed(operation.connection, null, notice);
+            } else if (!operation.username.equals(response.username())) {
                 clearIdentity(operation.connection); disconnect = operation.connection;
                 notice = "Login response did not match the requested identity; reconnect.";
+                event = new AuthEvent.LoginFailed(operation.connection, ErrorCode.AUTH_FAILED, notice);
             } else {
                 SessionView session = new SessionView(response.clientId(), response.username(), operation.connection);
                 client.supplySession(operation.connection, session);
@@ -244,10 +297,13 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
                         response.heartbeatIntervalSeconds(), response.presenceTimeoutSeconds());
                 stateChanged();
                 notice = "Logged in as " + response.username() + " (client ID: " + response.clientId() + ").";
+                event = new AuthEvent.LoginSucceeded(operation.connection, session,
+                        response.heartbeatIntervalSeconds(), response.presenceTimeoutSeconds());
             }
         }
         if (disconnect != null) client.disconnect(disconnect);
         emit(notice, operation.connection);
+        publishEvent(event);
     }
 
     private void errorResponse(MessageEnvelope message) {
@@ -255,6 +311,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         UUID disconnect = null;
         String notice;
         Pending operation;
+        AuthEvent event;
         synchronized (client) {
             operation = matching(message);
             if (operation == null || !(message.body() instanceof MessageBody.Error error)) return;
@@ -264,16 +321,19 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
                 // No retry of an uncertain login on this connection.
                 disconnect = operation.connection;
                 notice = "Login failed (" + error.code() + "). Reconnect before trying again.";
+                event = new AuthEvent.LoginFailed(operation.connection, error.code(), notice);
             } else {
                 if (error.code() == ErrorCode.UNAUTHENTICATED) {
                     clearIdentity(operation.connection); disconnect = operation.connection;
                 }
                 notice = "Logout failed (" + error.code() + ").";
+                event = new AuthEvent.LogoutFailed(operation.connection, error.code(), notice);
                 stateChanged();
             }
         }
         if (disconnect != null) client.disconnect(disconnect);
         emit(notice, operation.connection); // Never echo server-supplied error text.
+        publishEvent(event);
     }
 
     private void acknowledgement(MessageEnvelope message) {
@@ -289,6 +349,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         }
         client.disconnect(disconnect);
         emit("Logged out.", disconnect);
+        publishEvent(new AuthEvent.LogoutSucceeded(disconnect));
     }
 
     private void clearIdentity(UUID connection) {
@@ -310,7 +371,9 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
         }
         if (disconnect != null) {
             client.disconnect(disconnect);
-            emit("Authentication response timed out; original connection closed. Reconnect before trying again.", disconnect);
+            String timeoutMsg = "Authentication response timed out; original connection closed. Reconnect before trying again.";
+            emit(timeoutMsg, disconnect);
+            publishEvent(new AuthEvent.LoginTimedOut(disconnect, timeoutMsg));
         }
     }
 
@@ -332,7 +395,7 @@ public final class ClientAuthenticationAdapter implements AutoCloseable {
             pending = null;
             if (disconnect != null) clearIdentity(disconnect);
             credentials = null;
-            stateChanged(); stateListeners.clear();
+            stateChanged(); stateListeners.clear(); eventListeners.clear();
         }
         timer.shutdownNow();
         registrations.forEach(ClientDispatcher.Registration::close);

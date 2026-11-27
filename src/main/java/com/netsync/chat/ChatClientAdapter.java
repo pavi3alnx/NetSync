@@ -28,6 +28,16 @@ public final class ChatClientAdapter implements Closeable {
         void offer(String text, UUID connectionId, boolean activeGenerationOnly);
     }
 
+    /** Structured chat events for GUI and programmatic integration. */
+    public sealed interface ChatEvent {
+        UUID connectionId();
+        record MessageSent(UUID connectionId, UUID requestId, UUID recipientId, String text, Instant timestamp) implements ChatEvent {}
+        record MessageReceived(UUID connectionId, UUID senderClientId, String text, UUID sourceMessageId, Instant timestamp) implements ChatEvent {}
+        record MessageQueued(UUID connectionId, UUID requestId, UUID recipientId) implements ChatEvent {}
+        record MessageFailed(UUID connectionId, UUID requestId, UUID recipientId, ErrorCode code) implements ChatEvent {}
+        record MessageTimedOut(UUID connectionId, UUID requestId, UUID recipientId) implements ChatEvent {}
+    }
+
     private record PendingChat(UUID recipientId, UUID connectionId, UUID senderClientId, long startedNanos) {}
 
     private final ClientOutbound outbound;
@@ -45,6 +55,7 @@ public final class ChatClientAdapter implements Closeable {
     private final Map<UUID, PendingChat> pendingChats = new LinkedHashMap<>();
     private final LinkedHashSet<UUID> recentlyCompleted = new LinkedHashSet<>();
     private final List<ClientDispatcher.Registration> registrations = new ArrayList<>();
+    private final Set<Consumer<ChatEvent>> eventListeners = new LinkedHashSet<>();
     private final ScheduledExecutorService timer;
     private final CommandRegistry.Command chatCommand = this::executeChatCommand;
     private volatile UUID authenticatedGeneration;
@@ -141,19 +152,41 @@ public final class ChatClientAdapter implements Closeable {
                 credentials.session().connectionId().equals(currentConnection.get())).orElse(false);
     }
 
+    public ClientDispatcher.Registration onChatEvent(Consumer<ChatEvent> listener) {
+        Objects.requireNonNull(listener);
+        synchronized (lock) { eventListeners.add(listener); }
+        return () -> { synchronized (lock) { eventListeners.remove(listener); } };
+    }
+
+    private void publishEvent(ChatEvent event) {
+        List<Consumer<ChatEvent>> snapshot;
+        synchronized (lock) { snapshot = List.copyOf(eventListeners); }
+        for (Consumer<ChatEvent> listener : snapshot) {
+            try { listener.accept(event); } catch (RuntimeException ignored) { }
+        }
+    }
+
     private void executeChatCommand(List<String> args) {
         if (args.size() < 2) throw new CommandRegistry.InputException("Usage: /chat <recipientClientId> <message>");
         UUID recipientId;
         try { recipientId = UUID.fromString(args.getFirst()); }
         catch (IllegalArgumentException invalid) { throw new CommandRegistry.InputException("Invalid recipient UUID."); }
         String messageText = String.join(" ", args.subList(1, args.size()));
-        if (messageText.isBlank()) throw new CommandRegistry.InputException("Message text cannot be empty.");
+        sendMessage(recipientId, messageText);
+    }
+
+    /** Sends a private TCP chat message and returns the correlated request ID. */
+    public UUID sendMessage(UUID recipientId, String messageText) {
+        if (recipientId == null) throw new CommandRegistry.InputException("Recipient ID is required.");
+        if (messageText == null || messageText.isBlank()) throw new CommandRegistry.InputException("Message text cannot be empty.");
         if (messageText.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > ProtocolLimits.MAX_CHAT_BYTES)
             throw new CommandRegistry.InputException("Message text exceeds 4096 UTF-8 bytes.");
         if (closed) throw new CommandRegistry.InputException("Chat adapter is closed.");
 
         UUID connectionId;
         UUID senderClientId;
+        UUID messageId;
+        Instant now;
         synchronized (lockObject()) {
             if (!authenticated.getAsBoolean())
                 throw new CommandRegistry.InputException("Log in before sending chat messages.");
@@ -172,7 +205,7 @@ public final class ChatClientAdapter implements Closeable {
             synchronized (lock) {
                 if (pendingChats.size() >= pendingLimit)
                     throw new CommandRegistry.InputException("Chat has too many unanswered requests; wait for a response or timeout.");
-                UUID messageId = UUID.randomUUID();
+                messageId = UUID.randomUUID();
                 MessageEnvelope request = new MessageEnvelope(ProtocolLimits.VERSION, MessageType.CHAT_SEND,
                         messageId, null, new MessageBody.ChatSend(recipientId, messageText));
                 pendingChats.put(messageId, new PendingChat(recipientId, connectionId, senderClientId, nanoTime.getAsLong()));
@@ -186,10 +219,13 @@ public final class ChatClientAdapter implements Closeable {
                     pendingChats.remove(messageId);
                     throw new CommandRegistry.InputException("Chat message could not be queued; check connection status.");
                 }
-                emit("[" + TIME_FORMATTER.format(Instant.now()) + "] [Me -> " + recipientId + "]: "
+                now = Instant.now();
+                emit("[" + TIME_FORMATTER.format(now) + "] [Me -> " + recipientId + "]: "
                         + messageText + " (sending...)", connectionId, false);
             }
         }
+        publishEvent(new ChatEvent.MessageSent(connectionId, messageId, recipientId, messageText, now));
+        return messageId;
     }
 
     private Object lockObject() { return transport == null ? lock : transport; }
@@ -210,8 +246,11 @@ public final class ChatClientAdapter implements Closeable {
             if (generation == null || !transport.isGenerationCurrent(generation)
                     || !generation.equals(authenticatedGeneration)) return;
         }
-        emit("[" + TIME_FORMATTER.format(Instant.now()) + "] [From " + deliver.senderClientId() + "]: " + deliver.text(),
+        Instant now = Instant.now();
+        emit("[" + TIME_FORMATTER.format(now) + "] [From " + deliver.senderClientId() + "]: " + deliver.text(),
                 generation, false);
+        publishEvent(new ChatEvent.MessageReceived(generation, deliver.senderClientId(), deliver.text(),
+                deliver.sourceMessageId(), now));
     }
 
     void onAck(MessageEnvelope envelope) {
@@ -229,6 +268,7 @@ public final class ChatClientAdapter implements Closeable {
         }
         emit("[Chat] Queued for recipient " + pending.recipientId()
                 + "; this does not confirm that it was read.", pending.connectionId(), false);
+        publishEvent(new ChatEvent.MessageQueued(pending.connectionId(), envelope.replyTo(), pending.recipientId()));
     }
 
     void onError(MessageEnvelope envelope) {
@@ -244,6 +284,7 @@ public final class ChatClientAdapter implements Closeable {
         }
         emit("[Chat] Delivery failed for recipient " + pending.recipientId() + " (" + error.code() + ").",
                 pending.connectionId(), false);
+        publishEvent(new ChatEvent.MessageFailed(pending.connectionId(), envelope.replyTo(), pending.recipientId(), error.code()));
     }
 
     /** Used by the generic shell renderer to avoid printing chat-owned responses twice. */
@@ -283,7 +324,7 @@ public final class ChatClientAdapter implements Closeable {
     private void expirePending() {
         if (closed) return;
         long now = nanoTime.getAsLong();
-        List<PendingChat> expired = new ArrayList<>();
+        List<Map.Entry<UUID, PendingChat>> expired = new ArrayList<>();
         synchronized (lockObject()) {
             synchronized (lock) {
                 Iterator<Map.Entry<UUID, PendingChat>> iterator = pendingChats.entrySet().iterator();
@@ -293,16 +334,18 @@ public final class ChatClientAdapter implements Closeable {
                     if (now - pending.startedNanos() >= timeoutNanos) {
                         iterator.remove();
                         rememberCompleted(entry.getKey());
-                        expired.add(pending);
+                        expired.add(Map.entry(entry.getKey(), pending));
                     }
                 }
             }
         }
-        for (PendingChat pending : expired) {
+        for (Map.Entry<UUID, PendingChat> entry : expired) {
+            PendingChat pending = entry.getValue();
             if (closed || (transport != null && (!transport.isConnected()
                     || !transport.connectionId().filter(pending.connectionId()::equals).isPresent()))) continue;
             emit("[Chat] No response within 30 seconds; delivery outcome is unknown. No retry was sent.",
                     pending.connectionId(), true);
+            publishEvent(new ChatEvent.MessageTimedOut(pending.connectionId(), entry.getKey(), pending.recipientId()));
         }
     }
 
@@ -360,8 +403,7 @@ public final class ChatClientAdapter implements Closeable {
         synchronized (lockObject()) {
             if (closed) return;
             closed = true;
-            synchronized (lock) { pendingChats.clear(); }
-            synchronized (lock) { recentlyCompleted.clear(); }
+            synchronized (lock) { pendingChats.clear(); recentlyCompleted.clear(); eventListeners.clear(); }
             authenticatedGeneration = null;
         }
         timer.shutdownNow();

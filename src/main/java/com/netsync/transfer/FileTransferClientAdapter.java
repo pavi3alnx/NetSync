@@ -26,6 +26,21 @@ import java.util.function.Supplier;
  */
 public final class FileTransferClientAdapter implements Closeable {
 
+    /** Structured transfer events for GUI and programmatic integration. */
+    public sealed interface TransferEvent {
+        UUID connectionId();
+        record OfferSent(UUID connectionId, UUID recipientClientId, String fileName, long sizeBytes) implements TransferEvent {}
+        record OfferAssigned(UUID connectionId, UUID transferId) implements TransferEvent {}
+        record OfferReceived(UUID connectionId, UUID transferId, UUID senderClientId, String fileName, long sizeBytes) implements TransferEvent {}
+        record OfferAccepted(UUID connectionId, UUID transferId) implements TransferEvent {}
+        record Progress(UUID connectionId, FileTransferProgress progress) implements TransferEvent {}
+        record Completed(UUID connectionId, FileTransferResult result) implements TransferEvent {}
+        record Failed(UUID connectionId, UUID transferId, String reason) implements TransferEvent {}
+        record Cancelled(UUID connectionId, UUID transferId, String reason) implements TransferEvent {}
+        record Rejected(UUID connectionId, UUID transferId, String reason) implements TransferEvent {}
+        record Disconnected(UUID connectionId, boolean hadActiveTransfer) implements TransferEvent {}
+    }
+
     private final TcpClient client;
     private final CommandRegistry commands;
     private final Consumer<String> output;
@@ -34,6 +49,7 @@ public final class FileTransferClientAdapter implements Closeable {
     private final Path baseDownloadDir;
     private final FileTransferClientService service;
     private final List<ClientDispatcher.Registration> registrations = new ArrayList<>();
+    private final Set<Consumer<TransferEvent>> eventListeners = new LinkedHashSet<>();
     private final Map<UUID, UUID> transferGenerations = new ConcurrentHashMap<>();
     private final Set<UUID> activeGenerations = ConcurrentHashMap.newKeySet();
     private volatile UUID pendingSenderGeneration;
@@ -323,12 +339,24 @@ public final class FileTransferClientAdapter implements Closeable {
                 if (!client.isGenerationCurrent(generation)) return;
             }
             if (message.type() == MessageType.FILE_OFFERED && message.body() instanceof MessageBody.FileOffered offered) {
-                if (generation != null) transferGenerations.put(offered.transferId(), generation);
+                if (generation != null) {
+                    if (transferGenerations.size() >= 32) {
+                        UUID activeId = service.activeTransferId().orElse(null);
+                        transferGenerations.keySet().removeIf(id -> !id.equals(activeId));
+                    }
+                    transferGenerations.put(offered.transferId(), generation);
+                }
             } else if (message.type() == MessageType.ACK && message.body() instanceof MessageBody.Ack ack
                     && ack.operation() == MessageType.FILE_OFFER && ack.transferId() != null && pendingSenderGeneration != null) {
                 if (!generationBound || pendingSenderGeneration.equals(generation)) {
-                    transferGenerations.put(ack.transferId(), pendingSenderGeneration);
+                    UUID assignedGen = pendingSenderGeneration;
+                    if (transferGenerations.size() >= 32) {
+                        UUID activeId = service.activeTransferId().orElse(null);
+                        transferGenerations.keySet().removeIf(id -> !id.equals(activeId));
+                    }
+                    transferGenerations.put(ack.transferId(), assignedGen);
                     pendingSenderGeneration = null;
+                    publishEvent(new TransferEvent.OfferAssigned(assignedGen, ack.transferId()));
                 } else {
                     return;
                 }
@@ -342,13 +370,6 @@ public final class FileTransferClientAdapter implements Closeable {
                 }
             }
             service.handleControl(message);
-            if (message.type() == MessageType.FILE_STATUS && message.body() instanceof MessageBody.FileStatus status
-                    && status.state() != FileStatusState.ACCEPTED) transferGenerations.remove(status.transferId());
-            if (message.type() == MessageType.ACK && message.body() instanceof MessageBody.Ack ack
-                    && ack.operation() == MessageType.FILE_RECEIVED && ack.transferId() != null)
-                transferGenerations.remove(ack.transferId());
-            if (message.type() == MessageType.ERROR && message.body() instanceof MessageBody.Error error
-                    && error.transferId() != null) transferGenerations.remove(error.transferId());
         };
 
         registrations.add(dispatcher.register(MessageType.FILE_OFFERED, controlHandler));
@@ -369,6 +390,28 @@ public final class FileTransferClientAdapter implements Closeable {
         }));
     }
 
+    public ClientDispatcher.Registration onTransferEvent(Consumer<TransferEvent> listener) {
+        Objects.requireNonNull(listener, "Transfer event listener must not be null");
+        synchronized (lock) { eventListeners.add(listener); }
+        return () -> { synchronized (lock) { eventListeners.remove(listener); } };
+    }
+
+    private void publishEvent(TransferEvent event) {
+        List<Consumer<TransferEvent>> snapshot;
+        synchronized (lock) { snapshot = List.copyOf(eventListeners); }
+        for (Consumer<TransferEvent> listener : snapshot) {
+            try { listener.accept(event); } catch (RuntimeException ignored) { }
+        }
+    }
+
+    private void publishForTransfer(UUID transferId, java.util.function.Function<UUID, TransferEvent> factory) {
+        UUID generation = transferId != null ? transferGenerations.get(transferId) : pendingSenderGeneration;
+        if (generationBound) {
+            if (generation == null || !client.isGenerationCurrent(generation)) return;
+        }
+        publishEvent(factory.apply(generation));
+    }
+
     private void configureEventListener() {
         service.setEventListener(new FileTransferClientService.FileTransferEventListener() {
             @Override
@@ -376,6 +419,7 @@ public final class FileTransferClientAdapter implements Closeable {
                 printForTransfer(transferId, String.format(Locale.ROOT,
                         "[Transfer] Incoming file offer from %s: %s (%s). Transfer ID: %s. Type /accept %s or /reject %s",
                         senderClientId, fileName, formatBytes(sizeBytes), transferId, transferId, transferId));
+                publishForTransfer(transferId, gen -> new TransferEvent.OfferReceived(gen, transferId, senderClientId, fileName, sizeBytes));
             }
 
             @Override
@@ -383,6 +427,7 @@ public final class FileTransferClientAdapter implements Closeable {
                 printForTransfer(progress.transferId(), String.format(Locale.ROOT,
                         "[Transfer] Progress [%s]: %.1f%% (%d/%d bytes, chunk #%d)",
                         progress.transferId(), progress.percentage(), progress.bytesTransferred(), progress.totalBytes(), progress.chunkSequence()));
+                publishForTransfer(progress.transferId(), gen -> new TransferEvent.Progress(gen, progress));
             }
 
             @Override
@@ -396,21 +441,25 @@ public final class FileTransferClientAdapter implements Closeable {
                             "[Transfer] Completed [%s]: %d bytes sent successfully",
                             result.transferId(), result.bytesTransferred()));
                 }
+                publishForTransfer(result.transferId(), gen -> new TransferEvent.Completed(gen, result));
             }
 
             @Override
             public void onFailed(UUID transferId, String reason) {
                 printForTransfer(transferId, String.format(Locale.ROOT, "[Transfer] Failed [%s]: %s", transferId, reason));
+                publishForTransfer(transferId, gen -> new TransferEvent.Failed(gen, transferId, reason));
             }
 
             @Override
             public void onCancelled(UUID transferId, String reason) {
                 printForTransfer(transferId, String.format(Locale.ROOT, "[Transfer] Cancelled [%s]: %s", transferId, reason));
+                publishForTransfer(transferId, gen -> new TransferEvent.Cancelled(gen, transferId, reason));
             }
 
             @Override
             public void onRejected(UUID transferId, String reason) {
                 printForTransfer(transferId, String.format(Locale.ROOT, "[Transfer] Rejected [%s]: %s", transferId, reason));
+                publishForTransfer(transferId, gen -> new TransferEvent.Rejected(gen, transferId, reason));
             }
         });
     }
@@ -434,6 +483,17 @@ public final class FileTransferClientAdapter implements Closeable {
             throw new CommandRegistry.InputException("Invalid recipient client ID format: " + args.get(0));
         }
 
+        sendFile(recipientClientId, Paths.get(args.get(1)));
+    }
+
+    /** Programmatic file offer operation suitable for CLI and GUI (supports paths with spaces). */
+    public void sendFile(UUID recipientClientId, Path sourceFile) {
+        if (recipientClientId == null) {
+            throw new CommandRegistry.InputException("Recipient client ID is required.");
+        }
+        if (sourceFile == null) {
+            throw new CommandRegistry.InputException("Source file is required.");
+        }
         if (!client.isConnected()) {
             throw new CommandRegistry.InputException("Not connected to server. Use /connect first.");
         }
@@ -447,7 +507,6 @@ public final class FileTransferClientAdapter implements Closeable {
             throw new CommandRegistry.InputException("Cannot send file to yourself.");
         }
 
-        Path sourceFile = Paths.get(args.get(1));
         if (!Files.exists(sourceFile)) {
             throw new CommandRegistry.InputException("Source file does not exist: " + sourceFile);
         }
@@ -479,8 +538,10 @@ public final class FileTransferClientAdapter implements Closeable {
             activeGenerations.add(gen);
             pendingSenderGeneration = gen;
             service.sendFile(recipientClientId, sourceFile);
+            String displayName = sourceFile.getFileName() != null ? sourceFile.getFileName().toString() : sourceFile.toString();
             print(String.format(Locale.ROOT, "[Transfer] Offering file %s (%s) to %s...",
-                    sourceFile.getFileName(), formatBytes(sizeBytes), recipientClientId));
+                    displayName, formatBytes(sizeBytes), recipientClientId));
+            publishEvent(new TransferEvent.OfferSent(gen, recipientClientId, displayName, sizeBytes));
         } catch (IllegalStateException e) {
             pendingSenderGeneration = null;
             throw new CommandRegistry.InputException(e.getMessage());
@@ -501,7 +562,14 @@ public final class FileTransferClientAdapter implements Closeable {
         } catch (IllegalArgumentException e) {
             throw new CommandRegistry.InputException("Invalid transfer ID format: " + args.get(0));
         }
+        acceptOffer(transferId);
+    }
 
+    /** Programmatic offer acceptance suitable for CLI and GUI. */
+    public void acceptOffer(UUID transferId) {
+        if (transferId == null) {
+            throw new CommandRegistry.InputException("Transfer ID is required.");
+        }
         if (!client.isConnected()) {
             throw new CommandRegistry.InputException("Not connected to server. Use /connect first.");
         }
@@ -518,8 +586,10 @@ public final class FileTransferClientAdapter implements Closeable {
         }
 
         try {
+            UUID gen = client.connectionId().orElse(null);
             service.acceptOffer(transferId);
             print("[Transfer] Accepted offer for transfer " + transferId + ". Starting download...");
+            publishEvent(new TransferEvent.OfferAccepted(gen, transferId));
         } catch (IllegalStateException e) {
             throw new CommandRegistry.InputException(e.getMessage());
         } catch (Exception e) {
@@ -538,7 +608,14 @@ public final class FileTransferClientAdapter implements Closeable {
         } catch (IllegalArgumentException e) {
             throw new CommandRegistry.InputException("Invalid transfer ID format: " + args.get(0));
         }
+        rejectOffer(transferId);
+    }
 
+    /** Programmatic offer rejection suitable for CLI and GUI. */
+    public void rejectOffer(UUID transferId) {
+        if (transferId == null) {
+            throw new CommandRegistry.InputException("Transfer ID is required.");
+        }
         if (service.receiverState().isEmpty()
                 || service.receiverState().get() != FileReceiver.ReceiverState.OFFERED
                 || !transferId.equals(service.activeTransferId().orElse(null))) {
@@ -568,30 +645,44 @@ public final class FileTransferClientAdapter implements Closeable {
                 throw new CommandRegistry.InputException("Invalid transfer ID format: " + args.get(0));
             }
         }
+        if (transferId != null) {
+            cancelTransfer(transferId);
+        } else {
+            cancelActiveTransfer();
+        }
+    }
 
+    /** Programmatic transfer cancellation by transfer ID. */
+    public void cancelTransfer(UUID transferId) {
+        if (transferId == null) {
+            throw new CommandRegistry.InputException("Transfer ID is required.");
+        }
         if (!service.isTransferActive()) {
             throw new CommandRegistry.InputException("No active file transfer to cancel.");
         }
-
-        if (transferId != null) {
-            if (!transferId.equals(service.activeTransferId().orElse(null))) {
-                throw new CommandRegistry.InputException("Active transfer ID ("
-                        + service.activeTransferId().orElse(null) + ") does not match: " + transferId);
-            }
-
-            service.cancelTransfer(transferId);
-            print("[Transfer] Cancelled transfer " + transferId + ".");
-        } else {
-            Optional<UUID> activeId = service.activeTransferId();
-            service.cancelActiveTransfer();
-            print("[Transfer] Cancelled active transfer" + activeId.map(id -> " " + id).orElse("") + ".");
+        if (!transferId.equals(service.activeTransferId().orElse(null))) {
+            throw new CommandRegistry.InputException("Active transfer ID ("
+                    + service.activeTransferId().orElse(null) + ") does not match: " + transferId);
         }
+        service.cancelTransfer(transferId);
+        print("[Transfer] Cancelled transfer " + transferId + ".");
+    }
+
+    /** Programmatic cancellation of whichever transfer is currently active. */
+    public void cancelActiveTransfer() {
+        if (!service.isTransferActive()) {
+            throw new CommandRegistry.InputException("No active file transfer to cancel.");
+        }
+        Optional<UUID> activeId = service.activeTransferId();
+        service.cancelActiveTransfer();
+        print("[Transfer] Cancelled active transfer" + activeId.map(id -> " " + id).orElse("") + ".");
     }
 
     /**
      * Invoked when the client TCP connection disconnects. Cancels active transfers and cleans up partial files.
      */
     public void onDisconnect() {
+        UUID lastGen = activeGenerations.stream().findFirst().orElse(pendingSenderGeneration);
         transferGenerations.clear();
         activeGenerations.clear();
         pendingSenderGeneration = null;
@@ -600,6 +691,7 @@ public final class FileTransferClientAdapter implements Closeable {
         if (wasActive) {
             print("[Transfer] Disconnected from server. Active transfer cancelled.");
         }
+        publishEvent(new TransferEvent.Disconnected(lastGen, wasActive));
     }
 
     public FileTransferClientService transferService() {
@@ -687,6 +779,7 @@ public final class FileTransferClientAdapter implements Closeable {
                 return;
             }
             closed = true;
+            eventListeners.clear();
         }
 
         if (disconnectRegistration != null) disconnectRegistration.close();
