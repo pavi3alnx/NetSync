@@ -242,15 +242,21 @@ class FileTransferProductionIntegrationTest {
                 username -> ("disposable-" + username).toCharArray());
         CountDownLatch blockWrite = new CountDownLatch(1);
         CountDownLatch releaseWrite = new CountDownLatch(1);
+        CountDownLatch writeFinished = new CountDownLatch(1);
         AtomicBoolean holdNextWrite = new AtomicBoolean(false);
         SafeFileStorage serverStorage = new SafeFileStorage(temp.resolve("consent-server")) {
             @Override public void appendChunk(UUID id, byte[] data, int offset, int length) throws IOException {
-                if (holdNextWrite.compareAndSet(true, false)) {
+                boolean wasHeld = holdNextWrite.compareAndSet(true, false);
+                if (wasHeld) {
                     blockWrite.countDown();
                     try { releaseWrite.await(5, TimeUnit.SECONDS); }
                     catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException(e); }
                 }
-                super.appendChunk(id, data, offset, length);
+                try {
+                    super.appendChunk(id, data, offset, length);
+                } finally {
+                    if (wasHeld) writeFinished.countDown();
+                }
             }
         };
         try (NetSyncServerApplication app = new NetSyncServerApplication(config, credentials,
@@ -291,6 +297,7 @@ class FileTransferProductionIntegrationTest {
                 alice.client.execute("/cancel " + senderCancelTid);
                 await(() -> app.transferCoordinator().service().registry().activeCount() == 0);
                 releaseWrite.countDown();
+                assertTrue(writeFinished.await(5, TimeUnit.SECONDS), "Held write should finish before checking post-write cleanup");
                 await(() -> alice.text().contains("Cancelled transfer " + senderCancelTid)
                         && bob.text().contains("[Transfer] Cancelled [" + senderCancelTid)
                         && !serverStorage.exists(senderCancelTid));

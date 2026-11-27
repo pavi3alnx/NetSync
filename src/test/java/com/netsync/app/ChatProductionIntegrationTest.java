@@ -105,7 +105,12 @@ class ChatProductionIntegrationTest {
                 alice.client.execute("/logout");
                 await(() -> alice.text().contains("Logged out."));
                 assertTrue(alice.client.authentication().presenceCredentials().isEmpty());
-                alice.client.execute("/connect 127.0.0.1 " + app.port() + " " + app.udpPort());
+                await(() -> {
+                    if (!alice.client.transport().isConnected()) {
+                        alice.client.execute("/connect 127.0.0.1 " + app.port() + " " + app.udpPort());
+                    }
+                    return alice.client.transport().isConnected();
+                });
                 alice.client.execute("/login alice");
                 await(() -> alice.client.authentication().presenceCredentials().isPresent());
                 assertNotEquals(oldGeneration, alice.client.authentication().presenceCredentials()
